@@ -1,4 +1,4 @@
-name: Enhanced Java Application Pipeline with Metrics and Energy Monitoring
+name: Enhanced Java Application Pipeline with Metrics
 
 on:
   push:
@@ -35,51 +35,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup directories and tools
+      - name: Setup monitoring tools
+        id: setup-monitoring
+        timeout-minutes: 5
         run: |
           set -eo pipefail
           
-          # Créer la structure des répertoires
-          mkdir -p metrics/system
-          mkdir -p metrics/power
-          mkdir -p metrics/performance
+          echo "::group::Installing system packages"
+          sudo apt-get update || (echo "Failed to update package lists" && exit 1)
+          sudo apt-get install -y powerstat linux-tools-common linux-tools-generic || (echo "Failed to install powerstat and linux tools" && exit 1)
+          echo "::endgroup::"
           
-          # Installation des packages nécessaires
-          sudo apt-get update
-          sudo apt-get install -y powerstat linux-tools-common linux-tools-generic python3-pip
-          
-          # Installation de PowerAPI et pandas
-          pip3 install powerapi pandas
-          
-          # Vérifier les installations
-          python3 --version
-          pip3 list | grep powerapi
-          pip3 list | grep pandas
-
-      - name: Cache Maven packages
-        uses: actions/cache@v3
-        with:
-          path: ~/.m2
-          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
-          restore-keys: ${{ runner.os }}-m2
+          echo "::group::Setting up node exporter"
+          curl -L --retry 3 https://github.com/prometheus/node_exporter/releases/download/v1.3.1/node_exporter-1.3.1.linux-amd64.tar.gz -o node_exporter.tar.gz || (echo "Failed to download node exporter" && exit 1)
+          tar xvfz node_exporter.tar.gz || (echo "Failed to extract node exporter" && exit 1)
+          echo "::endgroup::"
 
       - name: Start monitoring
         id: start-monitoring
+        timeout-minutes: 2
         run: |
           set -eo pipefail
           
-          # Enregistrer le temps de début
-          date +%s%N > metrics/pipeline_start_time.txt
+          ./node_exporter-*/node_exporter --web.listen-address=":9100" &
+          echo "NODE_EXPORTER_PID=$!" >> $GITHUB_ENV
           
-          # Collecter les métriques initiales
-          echo "=== Initial System Resources ===" > metrics/system/initial_metrics.txt
-          top -b -n 1 >> metrics/system/initial_metrics.txt
+          timeout 30s bash -c 'until curl -s http://localhost:9100/metrics > /dev/null; do sleep 1; done' || (echo "Node exporter failed to start" && exit 1)
           
-          echo "=== Initial Memory Usage ===" > metrics/system/initial_memory.txt
-          free -m >> metrics/system/initial_memory.txt
-          
-          echo "=== Initial Disk Usage ===" > metrics/system/initial_disk.txt
-          df -h >> metrics/system/initial_disk.txt
+          date +%s%N > pipeline_start_time.txt
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -92,58 +75,53 @@ jobs:
         id: build
         timeout-minutes: 15
         env:
-          MAVEN_OPTS: "-Xmx2048m -XX:+TieredCompilation -XX:TieredStopAtLevel=1"
+          MAVEN_OPTS: "-Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn"
         run: |
           set -eo pipefail
           
+          echo "Creating checkstyle suppressions file..."
+          cat > checkstyle-suppressions.xml << 'EOF'
+          <?xml version="1.0"?>
+          <!DOCTYPE suppressions PUBLIC
+            "-//Checkstyle//DTD SuppressionFilter Configuration 1.2//EN"
+            "https://checkstyle.org/dtds/suppressions_1_2.dtd">
+          <suppressions>
+            <suppress files="node_exporter.*" checks="NoHttp"/>
+          </suppressions>
+          EOF
+          
+          echo "Modifying checkstyle configuration..."
+          if [ -f "src/checkstyle/nohttp-checkstyle.xml" ]; then
+            sed -i '/<module name="Checker">/a \    <module name="SuppressionFilter">\n      <property name="file" value="${config_loc}/checkstyle-suppressions.xml"/>\n    </module>' src/checkstyle/nohttp-checkstyle.xml
+          fi
+          
+          echo "Starting Maven build..."
           start_time=$(date +%s%N)
           
-          # Collecter les métriques avant build
-          free -m > metrics/system/pre_build_memory.txt
-          
-          # Build optimisé
           ./mvnw -B verify \
-            -Dmaven.test.skip=true \
-            -Dcheckstyle.skip=true \
-            -T 1C
+            -Dcheckstyle.config.location=src/checkstyle/nohttp-checkstyle.xml \
+            -Dcheckstyle.suppressions.location=checkstyle-suppressions.xml
           
           build_status=$?
           end_time=$(date +%s%N)
-          
-          # Collecter les métriques post-build
-          free -m > metrics/system/post_build_memory.txt
-          
-          # Enregistrer le temps de build
           echo "BUILD_TIME=$((($end_time - $start_time)/1000000))" >> $GITHUB_ENV
-          echo "$((($end_time - $start_time)/1000000))" > metrics/performance/build_time.txt
           
-          exit $build_status
+          if [ $build_status -ne 0 ]; then
+            echo "::error::Maven build failed with status $build_status"
+            exit $build_status
+          fi
 
       - name: Run tests
         id: test
-        if: success()
+        if: success() || failure()
         timeout-minutes: 20
         run: |
           set -eo pipefail
-          
           start_time=$(date +%s%N)
-          
-          # Collecter les métriques pré-tests
-          free -m > metrics/system/pre_test_memory.txt
-          
-          # Tests optimisés
-          ./mvnw test -T 1C
-          
+          ./mvnw test
           test_status=$?
           end_time=$(date +%s%N)
-          
-          # Collecter les métriques post-tests
-          free -m > metrics/system/post_test_memory.txt
-          
-          # Enregistrer le temps des tests
           echo "TEST_TIME=$((($end_time - $start_time)/1000000))" >> $GITHUB_ENV
-          echo "$((($end_time - $start_time)/1000000))" > metrics/performance/test_time.txt
-          
           exit $test_status
 
       - name: Build Docker image
@@ -153,86 +131,46 @@ jobs:
         run: |
           set -eo pipefail
           
+          # Debug: List contents of current directory
+           echo "Current directory contents:"
+            ls -la
+          
+          # Debug: Print working directory
+          echo "Current working directory:"
+          pwd
+          
           start_time=$(date +%s%N)
-          
-          # Collecter les métriques pré-docker
-          free -m > metrics/system/pre_docker_memory.txt
-          df -h > metrics/system/pre_docker_disk.txt
-          
-          # Build Docker optimisé
-          docker build -t app:latest -f .devcontainer/Dockerfile . --no-cache
-          
+          docker build -t app:latest . --no-cache
           build_status=$?
           end_time=$(date +%s%N)
-          
-          # Collecter les métriques post-docker
-          free -m > metrics/system/post_docker_memory.txt
-          df -h > metrics/system/post_docker_disk.txt
-          
-          # Enregistrer le temps de build Docker
           echo "DOCKER_BUILD_TIME=$((($end_time - $start_time)/1000000))" >> $GITHUB_ENV
-          echo "$((($end_time - $start_time)/1000000))" > metrics/performance/docker_time.txt
-          
-          # Collecter la taille de l'image
-          docker images app:latest --format "{{.Size}}" > metrics/performance/docker_image_size.txt
-          
           exit $build_status
 
-      - name: Collect and analyze metrics
-        if: always()
+      - name: Setup Kubernetes
+        id: k8s-setup
+        if: success()
+        uses: helm/kind-action@v1
+        with:
+          wait: 120s
+
+      - name: Deploy to Kubernetes
+        id: deploy
+        if: success()
+        timeout-minutes: 10
         run: |
           set -eo pipefail
+          start_time=$(date +%s%N)
+          kubectl apply -f k8s/ || (echo "Failed to apply Kubernetes manifests" && exit 1)
           
-          # Collecter les métriques système finales
-          echo "=== Final System Resources ===" > metrics/system/final_metrics.txt
-          top -b -n 1 >> metrics/system/final_metrics.txt || echo "Failed to collect top metrics"
+          if ! kubectl wait --for=condition=ready pod -l app=petclinic --timeout=180s; then
+            echo "::error::Deployment failed - collecting debug information"
+            kubectl describe pods -l app=petclinic
+            kubectl logs -l app=petclinic --all-containers=true
+            exit 1
+          fi
           
-          echo "=== Final Memory Usage ===" > metrics/system/final_memory.txt
-          free -m >> metrics/system/final_memory.txt || echo "Failed to collect memory metrics"
-          
-          echo "=== Final Disk Usage ===" > metrics/system/final_disk.txt
-          df -h >> metrics/system/final_disk.txt || echo "Failed to collect disk metrics"
-          
-          # Marquer la fin du pipeline
-          date +%s%N > metrics/pipeline_end_time.txt
-          
-          # Analyser les temps d'exécution
-          python3 << EOF
-          import pandas as pd
-          import os
-          
-          def read_time_file(filename):
-              try:
-                  with open(filename, 'r') as f:
-                      return float(f.read().strip())
-              except:
-                  return 0
-          
-          # Collecter les temps
-          times = {
-              'build': read_time_file('metrics/performance/build_time.txt'),
-              'test': read_time_file('metrics/performance/test_time.txt'),
-              'docker': read_time_file('metrics/performance/docker_time.txt')
-          }
-          
-          # Créer le rapport de performance
-          with open('metrics/performance/summary.txt', 'w') as f:
-              f.write("Pipeline Performance Summary\n")
-              f.write("==========================\n\n")
-          
-              total_time = sum(times.values())
-          
-              for stage, duration in times.items():
-                  percentage = (duration / total_time * 100) if total_time > 0 else 0
-                  f.write(f"{stage.capitalize()} Stage:\n")
-                  f.write(f"Duration: {duration/1000:.2f} seconds\n")
-                  f.write(f"Percentage of total time: {percentage:.1f}%\n\n")
-          
-              f.write(f"Total Pipeline Duration: {total_time/1000:.2f} seconds\n")
-          
-          # Créer un CSV avec les métriques
-          pd.DataFrame([times]).to_csv('metrics/performance/times.csv', index=False)
-          EOF
+          end_time=$(date +%s%N)
+          echo "DEPLOY_TIME=$((($end_time - $start_time)/1000000))" >> $GITHUB_ENV
 
       - name: Export metrics to Prometheus
         if: always()
@@ -240,39 +178,90 @@ jobs:
         run: |
           set -eo pipefail
           
-          function export_metric() {
+          export_metric() {
             local metric_name=$1
             local metric_value=$2
             local stage=$3
           
             if [ -n "$metric_value" ]; then
-              echo "${metric_name}{stage=\"${stage}\",project=\"java-app\"} ${metric_value}" | \
-                curl --retry 3 --max-time 10 --silent --show-error \
-                  --data-binary @- http://localhost:9091/metrics/job/pipeline-metrics || \
-                echo "Failed to export metric ${metric_name}"
+              echo "${metric_name}{stage=\"${stage}\",project=\"petclinic\"} ${metric_value}" | \
+                curl --retry 3 --retry-delay 2 --max-time 10 --silent --show-error \
+                  --data-binary @- http://localhost:9091/metrics/job/petclinic-pipeline || \
+                echo "::warning::Failed to export ${metric_name} for ${stage}"
             fi
           }
           
-          # Exporter les temps d'exécution
-          export_metric "pipeline_duration_ms" "${BUILD_TIME}" "build"
-          export_metric "pipeline_duration_ms" "${TEST_TIME}" "test"
-          export_metric "pipeline_duration_ms" "${DOCKER_BUILD_TIME}" "docker"
+          export_metric "pipeline_build_duration_ms" "${BUILD_TIME}" "build"
+          export_metric "pipeline_test_duration_ms" "${TEST_TIME}" "test"
+          export_metric "pipeline_docker_build_duration_ms" "${DOCKER_BUILD_TIME}" "docker-build"
+          export_metric "pipeline_deploy_duration_ms" "${DEPLOY_TIME}" "deploy"
+
+      - name: Collect resource metrics
+        if: always()
+        timeout-minutes: 2
+        run: |
+          set -eo pipefail
           
-          # Exporter l'utilisation mémoire finale
-          mem_usage=$(free -b | grep Mem: | awk '{print $3}')
-          export_metric "memory_usage_bytes" "$mem_usage" "final"
+          export_metric() {
+            local metric_name=$1
+            local metric_value=$2
+            local stage=$3
+          
+            if [ -n "$metric_value" ]; then
+              echo "${metric_name}{stage=\"${stage}\",project=\"petclinic\"} ${metric_value}" | \
+                curl --retry 3 --retry-delay 2 --max-time 10 --silent --show-error \
+                  --data-binary @- http://localhost:9091/metrics/job/petclinic-pipeline || \
+                echo "::warning::Failed to export ${metric_name} for ${stage}"
+            fi
+          }
+          
+          mem_usage=$(free -b | grep Mem: | awk '{print $3}') || echo "::warning::Failed to collect memory usage"
+          if [ -n "$mem_usage" ]; then
+            export_metric "pipeline_memory_usage_bytes" "$mem_usage" "memory"
+          fi
+          
+          cpu_usage=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}') || echo "::warning::Failed to collect CPU usage"
+          if [ -n "$cpu_usage" ]; then
+            export_metric "pipeline_cpu_usage_percent" "$cpu_usage" "cpu"
+          fi
+
+      - name: Collect final metrics
+        if: always()
+        timeout-minutes: 5
+        run: |
+          set -eo pipefail
+          
+          date +%s%N > pipeline_end_time.txt
+          
+          if [ -n "$NODE_EXPORTER_PID" ]; then
+            kill $NODE_EXPORTER_PID || echo "::warning::Failed to stop node exporter"
+          fi
+          
+          {
+            echo "=== System Resources ===" > system_metrics.txt
+            top -b -n 1 >> system_metrics.txt
+          } || echo "::warning::Failed to collect top metrics"
+          
+          {
+            echo "=== Memory Usage ===" > memory_metrics.txt
+            free -m >> memory_metrics.txt
+          } || echo "::warning::Failed to collect memory metrics"
+          
+          {
+            echo "=== Disk Usage ===" > disk_metrics.txt
+            df -h >> disk_metrics.txt
+          } || echo "::warning::Failed to collect disk metrics"
 
       - name: Save metrics
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: pipeline-metrics
-          path: metrics/
+          path: |
+            system_metrics.txt
+            memory_metrics.txt
+            disk_metrics.txt
+            pipeline_start_time.txt
+            pipeline_end_time.txt
           retention-days: 90
           if-no-files-found: warn
-
-      - name: Cleanup
-        if: always()
-        run: |
-          docker system prune -af
-          rm -rf node_exporter*
