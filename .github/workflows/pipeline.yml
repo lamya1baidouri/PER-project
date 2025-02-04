@@ -1,4 +1,4 @@
-name: Enhanced Java Application Pipeline with Performance Monitoring
+name: Enhanced Java Application Pipeline
 
 on:
   push:
@@ -7,22 +7,31 @@ on:
     branches: [ pipeline-optimization ]
 
 jobs:
-  performance-metrics:
+  build-with-metrics:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Performance Monitoring Tools
+      - name: Setup directories and install dependencies
         run: |
-          # Install performance monitoring tools
+          set -eo pipefail
+          
+          # Create metrics directories
+          mkdir -p metrics/system
+          mkdir -p metrics/performance
+          
+          # Install necessary packages
           sudo apt-get update
           sudo apt-get install -y \
             linux-tools-common \
-            python3-pip
-          
-          pip3 install psutil pandas numpy
+            linux-tools-generic \
+            python3-pip \
+            python3-psutil
+
+          # Install Python dependencies
+          pip3 install pandas numpy
 
       - name: Create performance monitoring script
         run: |
@@ -32,115 +41,76 @@ jobs:
           import os
           import sys
           import time
-          import psutil
-          import signal
+          from datetime import datetime
 
-          class TimeoutException(Exception):
-              pass
-
-          def timeout_handler(signum, frame):
-              raise TimeoutException("Command timed out")
-
-          def monitor_performance(command, output_file, timeout=1800):  # 30 minutes default timeout
+          def monitor_performance(command, output_file):
+              # Ensure directory exists
               os.makedirs(os.path.dirname(output_file), exist_ok=True)
           
+              # Prepare the CSV file
               with open(output_file, 'w', newline='') as csvfile:
                   writer = csv.writer(csvfile)
                   writer.writerow([
                       'Timestamp', 
-                      'CPU_Usage_%', 
-                      'Memory_Usage_MB', 
-                      'Memory_Percent', 
-                      'Disk_Read_MB', 
-                      'Disk_Write_MB'
+                      'CPU_Usage', 
+                      'Memory_Usage', 
+                      'Description'
                   ])
           
-                  # Capture initial disk I/O and system state
-                  disk_io_start = psutil.disk_io_counters()
+              try:
+                  # Execute the main command
+                  start_time = datetime.now()
           
-                  # Setup timeout
-                  signal.signal(signal.SIGALRM, timeout_handler)
-                  signal.alarm(timeout)
+                  # Run the command with performance monitoring
+                  process = subprocess.Popen(
+                      f"top -b -n 1 & {command}", 
+                      shell=True, 
+                      stdout=subprocess.PIPE, 
+                      stderr=subprocess.PIPE, 
+                      text=True
+                  )
           
-                  try:
-                      # Run the main command
-                      start_time = time.time()
-                      process = subprocess.Popen(
-                          command, 
-                          shell=True, 
-                          stdout=subprocess.PIPE, 
-                          stderr=subprocess.PIPE,
-                          universal_newlines=True
-                      )
+                  # Wait for the process to complete
+                  _, stderr = process.communicate()
           
-                      # Monitor while process is running
-                      while process.poll() is None:
-                          current_time = time.time()
+                  end_time = datetime.now()
           
-                          # Get current system metrics
-                          cpu_usage = psutil.cpu_percent()
-                          memory = psutil.virtual_memory()
-                          memory_usage_mb = memory.used / (1024 * 1024)
-                          memory_percent = memory.percent
+                  # Log performance metrics
+                  with open(output_file, 'a', newline='') as csvfile:
+                      writer = csv.writer(csvfile)
+                      writer.writerow([
+                          start_time.isoformat(),
+                          f"CommandStart: {start_time}",
+                          f"CommandEnd: {end_time}",
+                          "Overall Timing"
+                      ])
           
-                          # Get current disk I/O
-                          disk_io_current = psutil.disk_io_counters()
-                          disk_read_mb = (disk_io_current.read_bytes - disk_io_start.read_bytes) / (1024 * 1024)
-                          disk_write_mb = (disk_io_current.write_bytes - disk_io_start.write_bytes) / (1024 * 1024)
+                  # Check for any errors
+                  if process.returncode != 0:
+                      print(f"Command failed with error: {stderr}", file=sys.stderr)
+                      return process.returncode
           
-                          writer.writerow([
-                              time.strftime('%Y-%m-%d %H:%M:%S'),
-                              cpu_usage,
-                              memory_usage_mb,
-                              memory_percent,
-                              disk_read_mb,
-                              disk_write_mb
-                          ])
+                  return 0
           
-                          time.sleep(1)  # Sampling interval
+              except Exception as e:
+                  print(f"Error monitoring performance: {e}", file=sys.stderr)
+                  return 1
           
-                      # Wait for process to complete
-                      stdout, stderr = process.communicate()
-          
-                      # Return the process status
-                      return process.returncode, stdout, stderr
-          
-                  except TimeoutException:
-                      process.terminate()
-                      print("Command timed out", file=sys.stderr)
-                      return -1, None, None
-          
-                  finally:
-                      # Cancel the alarm
-                      signal.alarm(0)
-
           def main():
               if len(sys.argv) < 3:
                   print("Usage: python performance_monitor.py 'command' output_file.csv")
                   sys.exit(1)
-
+          
               command = sys.argv[1]
               output_file = sys.argv[2]
-
-              status, stdout, stderr = monitor_performance(command, output_file)
           
-              if status != 0:
-                  print(f"Command failed with status {status}")
-                  if stderr:
-                      print("Error output:", stderr)
-                  sys.exit(status)
-
+              monitor_performance(command, output_file)
+          
           if __name__ == '__main__':
               main()
           EOL
           
           chmod +x performance_monitor.py
-
-      - name: Create metrics directories
-        run: |
-          mkdir -p metrics/system
-          mkdir -p metrics/performance
-          mkdir -p metrics/resource_usage
 
       - name: Cache Maven packages
         uses: actions/cache@v3
@@ -156,7 +126,7 @@ jobs:
           # Record start time
           date +%s%N > metrics/pipeline_start_time.txt
           
-          # Collect initial system metrics
+          # Collect initial metrics
           echo "=== Initial System Resources ===" > metrics/system/initial_metrics.txt
           top -b -n 1 >> metrics/system/initial_metrics.txt
           
@@ -185,19 +155,17 @@ jobs:
           
           # Collect pre-build metrics
           free -m > metrics/system/pre_build_memory.txt
-          top -b -n 1 > metrics/system/pre_build_resources.txt
           
-          # Performance monitoring during Maven build
+          # Performance monitoring
           python3 performance_monitor.py \
             "./mvnw -B verify -Dmaven.test.skip=true -Dcheckstyle.skip=true -T 1C" \
-            metrics/performance/build_performance_metrics.csv
+            metrics/performance/build_performance.csv
           
           build_status=$?
           end_time=$(date +%s%N)
           
           # Collect post-build metrics
           free -m > metrics/system/post_build_memory.txt
-          top -b -n 1 > metrics/system/post_build_resources.txt
           
           # Record build time
           echo "$((($end_time - $start_time)/1000000))" > metrics/performance/build_time.txt
@@ -215,21 +183,19 @@ jobs:
           
           # Collect pre-test metrics
           free -m > metrics/system/pre_test_memory.txt
-          top -b -n 1 > metrics/system/pre_test_resources.txt
           
-          # Performance monitoring during tests
+          # Performance monitoring
           python3 performance_monitor.py \
             "./mvnw test -T 1C" \
-            metrics/performance/test_performance_metrics.csv
+            metrics/performance/test_performance.csv
           
           test_status=$?
           end_time=$(date +%s%N)
           
           # Collect post-test metrics
           free -m > metrics/system/post_test_memory.txt
-          top -b -n 1 > metrics/system/post_test_resources.txt
           
-          # Record test execution time
+          # Record test time
           echo "$((($end_time - $start_time)/1000000))" > metrics/performance/test_time.txt
           
           exit $test_status
@@ -243,28 +209,26 @@ jobs:
           
           start_time=$(date +%s%N)
           
-          # Collect pre-Docker build metrics
+          # Collect pre-docker metrics
           free -m > metrics/system/pre_docker_memory.txt
           df -h > metrics/system/pre_docker_disk.txt
-          top -b -n 1 > metrics/system/pre_docker_resources.txt
           
-          # Performance monitoring during Docker build
+          # Performance monitoring
           python3 performance_monitor.py \
             "docker build -t app:latest -f .devcontainer/Dockerfile . --no-cache" \
-            metrics/performance/docker_build_performance_metrics.csv
+            metrics/performance/docker_performance.csv
           
           build_status=$?
           end_time=$(date +%s%N)
           
-          # Collect post-Docker build metrics
+          # Collect post-docker metrics
           free -m > metrics/system/post_docker_memory.txt
           df -h > metrics/system/post_docker_disk.txt
-          top -b -n 1 > metrics/system/post_docker_resources.txt
           
           # Record Docker build time
           echo "$((($end_time - $start_time)/1000000))" > metrics/performance/docker_time.txt
           
-          # Collect Docker image size
+          # Collect image size
           docker images app:latest --format "{{.Size}}" > metrics/performance/docker_image_size.txt
           
           exit $build_status
