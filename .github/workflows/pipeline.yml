@@ -17,17 +17,23 @@ jobs:
       - name: Setup Rust and Scaphandre
         run: |
           
-          if ! command -v cargo &> /dev/null; then
-           curl https://sh.rustup.rs -sSf | sh -s -- -y
-           source "$HOME/.cargo/env"
-          fi
+          curl https://sh.rustup.rs -sSf | sh -s -- -y
+          source "$HOME/.cargo/env"
 
-          # Installer Scaphandre et configurer les permissions
-          cargo install scaphandre
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+    
+            RUST_LOG=debug cargo install scaphandre
+    
+   
           sudo cp $HOME/.cargo/bin/scaphandre /usr/local/bin/
           sudo setcap cap_sys_rawio=+ep /usr/local/bin/scaphandre
-          sudo chmod +r /dev/cpu/*/msr
+    
+    
+           sudo modprobe msr
+            sudo chmod +r /dev/cpu/*/msr || echo "Warning: Could not set MSR permissions"
+
+      
+          sudo /usr/local/bin/scaphandre json --step 1 || echo "Test run failed"
+
 
       - name: Setup directories and install dependencies
         run: |
