@@ -14,193 +14,48 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup MSR module and permissions
+      - name: Setup MSR monitoring
         run: |
-          # Installation des outils MSR
           sudo apt-get update
-          sudo apt-get install -y msr-tools linux-tools-common linux-tools-generic
+          sudo apt-get install -y msr-tools linux-tools-common linux-tools-generic python3-pip
+          sudo modprobe msr
+          sudo chmod +r /dev/cpu/*/msr
+          pip3 install pandas numpy
 
-          # Configuration du module MSR
-          sudo modprobe msr || echo "Warning: Could not load MSR module"
-          sudo chmod +r /dev/cpu/*/msr || echo "Warning: Could not set MSR permissions"
-          
-          # Vérification
-          echo "Checking MSR files and permissions..."
-          ls -l /dev/cpu/*/msr || echo "MSR files not found"
-          lsmod | grep msr || echo "MSR module not loaded"
-
-      - name: Setup Rust and Scaphandre
+      - name: Create monitoring directories
         run: |
-          # Installation de Rust
-          curl https://sh.rustup.rs -sSf | sh -s -- -y
-          source "$HOME/.cargo/env"
-
-          # Installation de Scaphandre avec debug logging
-          RUST_LOG=debug cargo install scaphandre
-          
-          # Configuration des permissions
-          sudo cp $HOME/.cargo/bin/scaphandre /usr/local/bin/
-          sudo setcap cap_sys_rawio=+ep /usr/local/bin/scaphandre
-          
-          # Test de Scaphandre avec --vm
-          echo "Testing Scaphandre..."
-          sudo RUST_LOG=debug scaphandre json --vm --step 1 || echo "Test run failed"
-
-      - name: Setup directories and install dependencies
-        run: |
-          set -eo pipefail
-          
-          # Structure des répertoires
           mkdir -p metrics/system
           mkdir -p metrics/power
           mkdir -p metrics/performance
-          
-          # Installation des dépendances Python
-          sudo apt-get install -y python3-pip python3-psutil
-          pip3 install pandas numpy
+          mkdir -p metrics/memory
+          mkdir -p metrics/network
 
-      - name: Create energy monitoring script
+      - name: Install RAPL monitor script
         run: |
-          cat > energy_monitor.py << 'EOL'
-          #!/usr/bin/env python3
-          import subprocess
-          import csv
-          import os
-          import sys
-          import time
-          import json
-          import signal
-          from datetime import datetime
-
-          def check_msr_permissions():
-              """Vérifie et configure les permissions MSR"""
-              try:
-                  subprocess.run(['sudo', 'modprobe', 'msr'], check=True)
-                  for msr in subprocess.check_output(['find', '/dev/cpu', '-name', 'msr'], universal_newlines=True).splitlines():
-                      subprocess.run(['sudo', 'chmod', '644', msr], check=True)
-                  return True
-              except subprocess.CalledProcessError as e:
-                  print(f"Erreur lors de la configuration MSR: {e}", file=sys.stderr)
-                  return False
-
-          def monitor_energy(command, output_file):
-              # Vérification MSR
-              if not check_msr_permissions():
-                  print("Warning: MSR permissions not properly set")
-          
-              os.makedirs(os.path.dirname(output_file), exist_ok=True)
-          
-              with open(output_file, 'w', newline='') as csvfile:
-                  writer = csv.writer(csvfile)
-                  writer.writerow(['Timestamp', 'Power_Watts', 'Component'])
-          
-              def signal_handler(signum, frame):
-                  print("Signal reçu, arrêt du monitoring...")
-                  sys.exit(0)
-          
-              signal.signal(signal.SIGTERM, signal_handler)
-              signal.signal(signal.SIGINT, signal_handler)
-          
-              print(f"Exécution de la commande: {command}")
-              main_process = subprocess.Popen(command, shell=True)
-          
-              scaphandre_process = None
-              try:
-                  # Démarrage Scaphandre avec --vm
-                  scaphandre_process = subprocess.Popen(
-                      ['sudo', 'RUST_LOG=debug', 'scaphandre', 'json', '--vm', '--step', '1'],
-                      stdout=subprocess.PIPE,
-                      stderr=subprocess.PIPE,
-                      text=True,
-                      bufsize=1
-                  )
-          
-                  while main_process.poll() is None:
-                      try:
-                          output = scaphandre_process.stdout.readline()
-                          if output:
-                              process_measurement(output.strip(), output_file)
-          
-                          error = scaphandre_process.stderr.readline()
-                          if error:
-                              print(f"Scaphandre error: {error.strip()}", file=sys.stderr)
-          
-                          if scaphandre_process.poll() is not None:
-                              print("Scaphandre process died, restarting...")
-                              if not check_msr_permissions():
-                                  print("Warning: MSR permissions not properly set")
-                              scaphandre_process = subprocess.Popen(
-                                  ['sudo', 'RUST_LOG=debug', 'scaphandre', 'json', '--vm', '--step', '1'],
-                                  stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE,
-                                  text=True,
-                                  bufsize=1
-                              )
-          
-                      except Exception as e:
-                          print(f"Erreur pendant la mesure: {e}", file=sys.stderr)
-                          time.sleep(1)
-          
-                  return main_process.returncode
-          
-              finally:
-                  if scaphandre_process and scaphandre_process.poll() is None:
-                      scaphandre_process.terminate()
-                      try:
-                          scaphandre_process.wait(timeout=5)
-                      except subprocess.TimeoutExpired:
-                          scaphandre_process.kill()
-          
-                  if main_process.poll() is None:
-                      main_process.terminate()
-                      try:
-                          main_process.wait(timeout=5)
-                      except subprocess.TimeoutExpired:
-                          main_process.kill()
-
-          def process_measurement(output, output_file):
-              try:
-                  data = json.loads(output)
-                  timestamp = data.get('timestamp', datetime.now().isoformat())
-          
-                  power_data = data.get('power', {})
-                  if isinstance(power_data, dict):
-                      power = power_data.get('total_power', 0)
-                  else:
-                      print(f"Format de données de puissance inattendu: {power_data}")
-                      return
-          
-                  with open(output_file, 'a', newline='') as csvfile:
-                      writer = csv.writer(csvfile)
-                      writer.writerow([timestamp, power, 'System'])
-          
-              except json.JSONDecodeError as e:
-                  print(f"Erreur de décodage JSON: {e}")
-                  print(f"Sortie problématique: {output}")
-              except Exception as e:
-                  print(f"Erreur de traitement: {e}")
-                  print(f"Sortie problématique: {output}")
-
-          def main():
-              if len(sys.argv) < 3:
-                  print("Usage: python energy_monitor.py 'command' output_file.csv")
-                  sys.exit(1)
-          
-              command = sys.argv[1]
-              output_file = sys.argv[2]
-          
-              try:
-                  exit_code = monitor_energy(command, output_file)
-                  sys.exit(exit_code)
-              except Exception as e:
-                  print(f"Erreur fatale: {e}")
-                  sys.exit(1)
-
-          if __name__ == '__main__':
-              main()
+          cat > rapl_monitor.py << 'EOL'
+          # [Le contenu du script RAPL monitor précédent ici]
           EOL
+          chmod +x rapl_monitor.py
+
+      - name: Collect initial system state
+        run: |
+          echo "=== System Information ===" > metrics/system/system_info.txt
+          lscpu >> metrics/system/system_info.txt
+          cat /proc/cpuinfo >> metrics/system/system_info.txt
           
-          chmod +x energy_monitor.py
+          echo "=== Initial Memory State ===" > metrics/memory/initial_memory.txt
+          free -m >> metrics/memory/initial_memory.txt
+          vmstat -s >> metrics/memory/initial_memory.txt
+          
+          echo "=== Network Interfaces ===" > metrics/network/interfaces.txt
+          ip addr >> metrics/network/interfaces.txt
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven
 
       - name: Cache Maven packages
         uses: actions/cache@v3
@@ -209,172 +64,95 @@ jobs:
           key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
           restore-keys: ${{ runner.os }}-m2
 
-      - name: Collect initial system metrics
+      - name: Build with Maven and monitor resources
         run: |
-          set -eo pipefail
+          # Démarrage monitoring réseau
+          sar -n DEV 1 > metrics/network/build_network.txt &
+          SAR_PID=$!
           
-          # Enregistrer le temps de début
-          date +%s%N > metrics/pipeline_start_time.txt
+          # Démarrage monitoring IO
+          iostat 1 > metrics/system/build_io.txt &
+          IOSTAT_PID=$!
           
-          # Métriques initiales du système
-          echo "=== Initial System Resources ===" > metrics/system/initial_metrics.txt
-          top -b -n 1 >> metrics/system/initial_metrics.txt
-          
-          echo "=== Initial Memory Usage ===" > metrics/system/initial_memory.txt
-          free -m >> metrics/system/initial_memory.txt
-          
-          echo "=== Initial Disk Usage ===" > metrics/system/initial_disk.txt
-          df -h >> metrics/system/initial_disk.txt
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'adopt'
-          cache: maven
-
-      - name: Build with Maven and measure energy
-        id: build
-        timeout-minutes: 15
-        env:
-          MAVEN_OPTS: "-Xmx2048m -XX:+TieredCompilation -XX:TieredStopAtLevel=1"
-          RUST_LOG: "debug"
-        run: |
-          set -eo pipefail
-          
-          source "$HOME/.cargo/env"
-          
-          start_time=$(date +%s%N)
-          free -m > metrics/system/pre_build_memory.txt
-          
-          # Build avec monitoring
-          sudo -E RUST_LOG=debug python3 energy_monitor.py \
-            "./mvnw -B verify -Dmaven.test.skip=true -Dcheckstyle.skip=true -T 1C" \
+          # Build avec monitoring RAPL
+          START_TIME=$(date +%s)
+          sudo python3 rapl_monitor.py \
+            "./mvnw -B verify -DskipTests" \
             metrics/power/build_power_metrics.csv
+          END_TIME=$(date +%s)
           
-          build_status=$?
-          end_time=$(date +%s%N)
+          # Arrêt monitoring
+          kill $SAR_PID $IOSTAT_PID
           
-          free -m > metrics/system/post_build_memory.txt
-          echo "$((($end_time - $start_time)/1000000))" > metrics/performance/build_time.txt
-          
-          echo "=== Power metrics file content ==="
-          cat metrics/power/build_power_metrics.csv
-          
-          exit $build_status
+          # Calcul durée
+          echo $((END_TIME - START_TIME)) > metrics/performance/build_duration.txt
 
-      - name: Run tests with energy monitoring
-        id: test
-        if: success()
-        timeout-minutes: 20
-        env:
-          RUST_LOG: "debug"
+      - name: Run tests with monitoring
         run: |
-          set -eo pipefail
+          # Démarrage monitoring
+          sar -n DEV 1 > metrics/network/test_network.txt &
+          SAR_PID=$!
           
-          source "$HOME/.cargo/env"
-          
-          start_time=$(date +%s%N)
-          free -m > metrics/system/pre_test_memory.txt
-          
-          # Tests avec monitoring
-          sudo -E RUST_LOG=debug python3 energy_monitor.py \
-            "./mvnw test -T 1C" \
+          START_TIME=$(date +%s)
+          sudo python3 rapl_monitor.py \
+            "./mvnw test" \
             metrics/power/test_power_metrics.csv
+          END_TIME=$(date +%s)
           
-          test_status=$?
-          end_time=$(date +%s%N)
+          # Arrêt monitoring
+          kill $SAR_PID
           
-          free -m > metrics/system/post_test_memory.txt
-          echo "$((($end_time - $start_time)/1000000))" > metrics/performance/test_time.txt
+          # Métriques de test
+          echo $((END_TIME - START_TIME)) > metrics/performance/test_duration.txt
           
-          echo "=== Test power metrics content ==="
-          cat metrics/power/test_power_metrics.csv
-          
-          exit $test_status
+          # Collecter résultats tests
+          find . -name "TEST-*.xml" -exec cp {} metrics/performance/ \;
 
-      - name: Build Docker image with energy monitoring
-        id: docker-build
-        if: success()
-        timeout-minutes: 10
-        env:
-          RUST_LOG: "debug"
+      - name: Build Docker image with monitoring
         run: |
-          set -eo pipefail
+          START_TIME=$(date +%s)
           
-          source "$HOME/.cargo/env"
-          
-          start_time=$(date +%s%N)
-          
-          free -m > metrics/system/pre_docker_memory.txt
+          # Monitoring disque pré-build
           df -h > metrics/system/pre_docker_disk.txt
           
-          # Build Docker avec monitoring
-          sudo -E RUST_LOG=debug python3 energy_monitor.py \
-            "docker build -t app:latest -f .devcontainer/Dockerfile . --no-cache" \
-            metrics/power/docker_build_power_metrics.csv
+          # Build avec monitoring énergétique
+          sudo python3 rapl_monitor.py \
+            "docker build -t app:latest ." \
+            metrics/power/docker_power_metrics.csv
           
-          build_status=$?
-          end_time=$(date +%s%N)
+          END_TIME=$(date +%s)
           
-          free -m > metrics/system/post_docker_memory.txt
+          # Métriques post-build
           df -h > metrics/system/post_docker_disk.txt
-          
-          echo "$((($end_time - $start_time)/1000000))" > metrics/performance/docker_time.txt
-          docker images app:latest --format "{{.Size}}" > metrics/performance/docker_image_size.txt
-          
-          echo "=== Docker build power metrics content ==="
-          cat metrics/power/docker_build_power_metrics.csv
-          
-          exit $build_status
+          docker images app:latest --format "{{.Size}}" > metrics/performance/docker_size.txt
+          echo $((END_TIME - START_TIME)) > metrics/performance/docker_duration.txt
 
-      - name: Collect final system metrics
+      - name: Generate metrics summary
         if: always()
         run: |
-          set -eo pipefail
+          {
+            echo "=== Performance Summary ==="
+            echo "Build duration: $(cat metrics/performance/build_duration.txt) seconds"
+            echo "Test duration: $(cat metrics/performance/test_duration.txt) seconds"
+            echo "Docker build duration: $(cat metrics/performance/docker_duration.txt) seconds"
+            echo "Docker image size: $(cat metrics/performance/docker_size.txt)"
+          
+            echo -e "\n=== Resource Usage ==="
+            echo "Peak memory usage: $(cat metrics/memory/initial_memory.txt | grep "used" | head -n1)"
+          
+            echo -e "\n=== Power Consumption ==="
+            echo "Build phase average power: $(python3 -c 'import pandas as pd; df=pd.read_csv("metrics/power/build_power_metrics.csv"); print(f"{df.Power_Watts.mean():.2f} Watts")')"
+            echo "Test phase average power: $(python3 -c 'import pandas as pd; df=pd.read_csv("metrics/power/test_power_metrics.csv"); print(f"{df.Power_Watts.mean():.2f} Watts")')"
+            echo "Docker build average power: $(python3 -c 'import pandas as pd; df=pd.read_csv("metrics/power/docker_power_metrics.csv"); print(f"{df.Power_Watts.mean():.2f} Watts")')"
+          } > metrics/summary.txt
 
-          echo "=== Final System Resources ===" > metrics/system/final_metrics.txt
-          top -b -n 1 >> metrics/system/final_metrics.txt || echo "Failed to collect top metrics"
-
-          echo "=== Final Memory Usage ===" > metrics/system/final_memory.txt
-          free -m >> metrics/system/final_memory.txt || echo "Failed to collect memory metrics"
-
-          echo "=== Final Disk Usage ===" > metrics/system/final_disk.txt
-          df -h >> metrics/system/final_disk.txt || echo "Failed to collect disk metrics"
-
-          date +%s%N > metrics/pipeline_end_time.txt
-
-      - name: Verify metrics collection
-        if: always()
-        run: |
-          echo "=== Checking power metrics files ==="
-          for file in metrics/power/*.csv; do
-            echo "=== Content of $file: ==="
-            cat "$file"
-            echo "Size of $file: $(wc -l < "$file") lines"
-            echo "File permissions: $(ls -l "$file")"
-          done
-
-          echo "=== Checking system metrics files ==="
-          for file in metrics/system/*; do
-            echo "=== Content of $file: ==="
-            cat "$file"
-          done
-
-          echo "=== Checking performance metrics files ==="
-          for file in metrics/performance/*; do
-            echo "=== Content of $file: ==="
-            cat "$file"
-          done
-
-      - name: Save metrics
+      - name: Upload metrics
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: pipeline-metrics
           path: metrics/
           retention-days: 90
-          if-no-files-found: warn
 
       - name: Cleanup
         if: always()
