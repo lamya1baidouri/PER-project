@@ -1,4 +1,4 @@
-name: Enhanced Java Application Pipeline with Energy Monitoring
+name: Enhanced Java Application Pipeline with Performance Monitoring
 
 on:
   push:
@@ -7,127 +7,140 @@ on:
     branches: [ pipeline-optimization ]
 
 jobs:
-  build-with-metrics:
+  performance-metrics:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup directories and install dependencies
+      - name: Setup Performance Monitoring Tools
         run: |
-          set -euo pipefail
-          
-          # Create directory structure
-          mkdir -p metrics/system
-          mkdir -p metrics/power
-          mkdir -p metrics/performance
-          
-          # Install dependencies
+          # Install performance monitoring tools
           sudo apt-get update
           sudo apt-get install -y \
-            python3-pip \
-            python3-psutil \
-            curl
-
-          # Install Python dependencies
-          pip3 install pandas numpy
-
-      - name: Create energy monitoring script
-        run: |
-          cat > energy_monitor.py << "EOL"
-#!/usr/bin/env python3
-            import os
-            import sys
-            import time
-              import csv
-              from datetime import datetime
-              import subprocess
-
-def get_vm_size():
-    """Get Azure VM size"""
-      try:
-        output = subprocess.check_output(['curl', '-H', 'Metadata:true',
-        'http://169.254.169.254/metadata/instance/compute/vmSize?api-version=2021-01-01&format=text'],
-        stderr=subprocess.DEVNULL)
-        return output.decode().strip()
-      except:
-        return 'Standard_DS2_v2'  # Default GitHub Actions VM size
-
-      def get_tdp():
-    """Determine TDP based on VM size"""
-      vm_sizes = {
-      'Standard_DS2_v2': 35,  # 2 vCPUs
-      'Standard_DS4_v2': 70,  # 4 vCPUs
-      'Standard_DS8_v2': 140  # 8 vCPUs
-      }
-      vm_size = get_vm_size()
-      return vm_sizes.get(vm_size, 35)  # Default 35W
-
-    def get_cpu_usage():
-     with open("/proc/stat") as f:
-        cpu = f.readline().split()
-      total = sum(map(int, cpu[1:]))
-      idle = int(cpu[4])
-      return total, idle
-
-def monitor_energy(command, output_file):
-    """Monitor energy usage on GitHub Actions VM"""
-      TDP = get_tdp()
-      BASE_POWER = TDP * 0.2  # 20% of TDP at idle
-      
-      os.makedirs(os.path.dirname(output_file), exist_ok=True)
-
-      with open(output_file, 'w', newline='') as csvfile:
-        writer = csv.writer(csvfile)
-        writer.writerow(['Timestamp', 'Power_Watts', 'Component'])
-
-      process = os.popen(command)
-      prev_total, prev_idle = get_cpu_usage()
-
-      while process.close() is None:
-      time.sleep(1)
-      total, idle = get_cpu_usage()
-      delta_total = total - prev_total
-      delta_idle = idle - prev_idle
-
-        if delta_total == 0:
-          cpu_percent = 0
-        else:
-          cpu_percent = 100 * (1 - delta_idle/delta_total)
-
-        # More accurate calculation for Azure VMs
-        power = BASE_POWER + (TDP - BASE_POWER) * (cpu_percent / 100.0) * 0.85  # VM correction factor
-
-        with open(output_file, 'a', newline='') as csvfile:
-          writer = csv.writer(csvfile)
-          writer.writerow([
-          datetime.now().isoformat(),
-          round(power, 2),
-          'System'
-          ])
-
-        prev_total, prev_idle = total, idle
-
-def main():
-  if len(sys.argv) < 3:
-    print("Usage: python energy_monitor.py 'command' output_file.csv")
-      sys.exit(1)
-  
-      command = sys.argv[1]
-      output_file = sys.argv[2]
-
-  try:
-    monitor_energy(command, output_file)
-  except Exception as e:
-    print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-if __name__ == '__main__':
-    main()
-EOL
+            linux-tools-common \
+            python3-pip
           
-          chmod +x energy_monitor.py
+          pip3 install psutil pandas numpy
+
+      - name: Create performance monitoring script
+        run: |
+          cat > performance_monitor.py << 'EOL'
+          import subprocess
+          import csv
+          import os
+          import sys
+          import time
+          import psutil
+          import signal
+
+          class TimeoutException(Exception):
+              pass
+
+          def timeout_handler(signum, frame):
+              raise TimeoutException("Command timed out")
+
+          def monitor_performance(command, output_file, timeout=1800):  # 30 minutes default timeout
+              os.makedirs(os.path.dirname(output_file), exist_ok=True)
+          
+              with open(output_file, 'w', newline='') as csvfile:
+                  writer = csv.writer(csvfile)
+                  writer.writerow([
+                      'Timestamp', 
+                      'CPU_Usage_%', 
+                      'Memory_Usage_MB', 
+                      'Memory_Percent', 
+                      'Disk_Read_MB', 
+                      'Disk_Write_MB'
+                  ])
+          
+                  # Capture initial disk I/O and system state
+                  disk_io_start = psutil.disk_io_counters()
+          
+                  # Setup timeout
+                  signal.signal(signal.SIGALRM, timeout_handler)
+                  signal.alarm(timeout)
+          
+                  try:
+                      # Run the main command
+                      start_time = time.time()
+                      process = subprocess.Popen(
+                          command, 
+                          shell=True, 
+                          stdout=subprocess.PIPE, 
+                          stderr=subprocess.PIPE,
+                          universal_newlines=True
+                      )
+          
+                      # Monitor while process is running
+                      while process.poll() is None:
+                          current_time = time.time()
+          
+                          # Get current system metrics
+                          cpu_usage = psutil.cpu_percent()
+                          memory = psutil.virtual_memory()
+                          memory_usage_mb = memory.used / (1024 * 1024)
+                          memory_percent = memory.percent
+          
+                          # Get current disk I/O
+                          disk_io_current = psutil.disk_io_counters()
+                          disk_read_mb = (disk_io_current.read_bytes - disk_io_start.read_bytes) / (1024 * 1024)
+                          disk_write_mb = (disk_io_current.write_bytes - disk_io_start.write_bytes) / (1024 * 1024)
+          
+                          writer.writerow([
+                              time.strftime('%Y-%m-%d %H:%M:%S'),
+                              cpu_usage,
+                              memory_usage_mb,
+                              memory_percent,
+                              disk_read_mb,
+                              disk_write_mb
+                          ])
+          
+                          time.sleep(1)  # Sampling interval
+          
+                      # Wait for process to complete
+                      stdout, stderr = process.communicate()
+          
+                      # Return the process status
+                      return process.returncode, stdout, stderr
+          
+                  except TimeoutException:
+                      process.terminate()
+                      print("Command timed out", file=sys.stderr)
+                      return -1, None, None
+          
+                  finally:
+                      # Cancel the alarm
+                      signal.alarm(0)
+
+          def main():
+              if len(sys.argv) < 3:
+                  print("Usage: python performance_monitor.py 'command' output_file.csv")
+                  sys.exit(1)
+
+              command = sys.argv[1]
+              output_file = sys.argv[2]
+
+              status, stdout, stderr = monitor_performance(command, output_file)
+          
+              if status != 0:
+                  print(f"Command failed with status {status}")
+                  if stderr:
+                      print("Error output:", stderr)
+                  sys.exit(status)
+
+          if __name__ == '__main__':
+              main()
+          EOL
+          
+          chmod +x performance_monitor.py
+
+      - name: Create metrics directories
+        run: |
+          mkdir -p metrics/system
+          mkdir -p metrics/performance
+          mkdir -p metrics/resource_usage
 
       - name: Cache Maven packages
         uses: actions/cache@v3
@@ -138,105 +151,152 @@ EOL
 
       - name: Collect initial system metrics
         run: |
-          set -euo pipefail
+          set -eo pipefail
           
-          echo "::group::Recording initial metrics"
-      
-      # Record start time
-                     date +%s%N > metrics/pipeline_start_time.txt
-      
-      # Collect initial metrics
-                     echo "=== Initial System Resources ===" > metrics/system/initial_metrics.txt
-                     top -b -n 1 >> metrics/system/initial_metrics.txt
-                     
-                     echo "=== Initial Memory Usage ===" > metrics/system/initial_memory.txt
-                     free -m >> metrics/system/initial_memory.txt
-                     
-                     echo "=== Initial Disk Usage ===" > metrics/system/initial_disk.txt
-                     df -h >> metrics/system/initial_disk.txt
-      
-      # Collect VM info
-                     echo "=== VM Information ===" > metrics/system/vm_info.txt
-                     curl -H Metadata:true "http://169.254.169.254/metadata/instance/compute?api-version=2021-01-01" 2>/dev/null >> metrics/system/vm_info.txt
-                     
-                     echo "::endgroup::"
+          # Record start time
+          date +%s%N > metrics/pipeline_start_time.txt
+          
+          # Collect initial system metrics
+          echo "=== Initial System Resources ===" > metrics/system/initial_metrics.txt
+          top -b -n 1 >> metrics/system/initial_metrics.txt
+          
+          echo "=== Initial Memory Usage ===" > metrics/system/initial_memory.txt
+          free -m >> metrics/system/initial_memory.txt
+          
+          echo "=== Initial Disk Usage ===" > metrics/system/initial_disk.txt
+          df -h >> metrics/system/initial_disk.txt
 
-    - name: Set up JDK 17
-      uses: actions/setup-java@v4
-      with:
-        java-version: '17'
-        distribution: 'adopt'
-        cache: maven
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'adopt'
+          cache: maven
 
-    - name: Build with Maven and measure energy
-      id: build
-      timeout-minutes: 15
-      env:
-        MAVEN_OPTS: "-Xmx2048m -XX:+TieredCompilation -XX:TieredStopAtLevel=1"
-      run: |
-        set -euo pipefail
-        
-        echo "::group::Building with Maven"
-        
-        start_time=$(date +%s%N)
-        free -m > metrics/system/pre_build_memory.txt
-        
-        # Build with monitoring
-        python3 energy_monitor.py \
-          "./mvnw -B verify -Dmaven.test.skip=true -Dcheckstyle.skip=true -T 1C" \
-          metrics/power/build_power_metrics.csv || {
-            echo "::error::Maven build failed"
-            exit 1
-          }
-        
-        build_status=$?
-        end_time=$(date +%s%N)
-        
-        free -m > metrics/system/post_build_memory.txt
-        echo "$((($end_time - $start_time)/1000000))" > metrics/performance/build_time.txt
-        
-        echo "::endgroup::"
-        exit $build_status
+      - name: Build with Maven and measure performance
+        id: build
+        timeout-minutes: 15
+        env:
+          MAVEN_OPTS: "-Xmx2048m -XX:+TieredCompilation -XX:TieredStopAtLevel=1"
+        run: |
+          set -eo pipefail
+          
+          start_time=$(date +%s%N)
+          
+          # Collect pre-build metrics
+          free -m > metrics/system/pre_build_memory.txt
+          top -b -n 1 > metrics/system/pre_build_resources.txt
+          
+          # Performance monitoring during Maven build
+          python3 performance_monitor.py \
+            "./mvnw -B verify -Dmaven.test.skip=true -Dcheckstyle.skip=true -T 1C" \
+            metrics/performance/build_performance_metrics.csv
+          
+          build_status=$?
+          end_time=$(date +%s%N)
+          
+          # Collect post-build metrics
+          free -m > metrics/system/post_build_memory.txt
+          top -b -n 1 > metrics/system/post_build_resources.txt
+          
+          # Record build time
+          echo "$((($end_time - $start_time)/1000000))" > metrics/performance/build_time.txt
+          
+          exit $build_status
 
-    - name: Run tests with energy monitoring
-      id: test
-      if: success() && steps.build.outcome == 'success'
-      timeout-minutes: 20
-      run: |
-        set -euo pipefail
-        
-        echo "::group::Running tests"
-        
-        start_time=$(date +%s%N)
-        free -m > metrics/system/pre_test_memory.txt
-        
-        # Tests with monitoring
-        python3 energy_monitor.py \
-          "./mvnw test -T 1C" \
-          metrics/power/test_power_metrics.csv || {
-            echo "::error::Tests failed"
-            exit 1
-          }
-        
-        test_status=$?
-        end_time=$(date +%s%N)
-        
-        free -m > metrics/system/post_test_memory.txt
-        echo "$((($end_time - $start_time)/1000000))" > metrics/performance/test_time.txt
-        
-        echo "::endgroup::"
-        exit $test_status
+      - name: Run tests with performance monitoring
+        id: test
+        if: success()
+        timeout-minutes: 20
+        run: |
+          set -eo pipefail
+          
+          start_time=$(date +%s%N)
+          
+          # Collect pre-test metrics
+          free -m > metrics/system/pre_test_memory.txt
+          top -b -n 1 > metrics/system/pre_test_resources.txt
+          
+          # Performance monitoring during tests
+          python3 performance_monitor.py \
+            "./mvnw test -T 1C" \
+            metrics/performance/test_performance_metrics.csv
+          
+          test_status=$?
+          end_time=$(date +%s%N)
+          
+          # Collect post-test metrics
+          free -m > metrics/system/post_test_memory.txt
+          top -b -n 1 > metrics/system/post_test_resources.txt
+          
+          # Record test execution time
+          echo "$((($end_time - $start_time)/1000000))" > metrics/performance/test_time.txt
+          
+          exit $test_status
 
-    - name: Build Docker image with energy monitoring
-      id: docker-build
-      if: success() && steps.test.outcome == 'success'
-      timeout-minutes: 10
-      run: |
-        set -euo pipefail
-        
-        echo "::group::Building Docker image"
-        
-        start_time=$(date +%s%N)
-        
-        free -m > metrics/system/pre_docker_memory.txt
-        df -h > metrics/system/pre_docker_disk.txt
+      - name: Build Docker image with performance monitoring
+        id: docker-build
+        if: success()
+        timeout-minutes: 10
+        run: |
+          set -eo pipefail
+          
+          start_time=$(date +%s%N)
+          
+          # Collect pre-Docker build metrics
+          free -m > metrics/system/pre_docker_memory.txt
+          df -h > metrics/system/pre_docker_disk.txt
+          top -b -n 1 > metrics/system/pre_docker_resources.txt
+          
+          # Performance monitoring during Docker build
+          python3 performance_monitor.py \
+            "docker build -t app:latest -f .devcontainer/Dockerfile . --no-cache" \
+            metrics/performance/docker_build_performance_metrics.csv
+          
+          build_status=$?
+          end_time=$(date +%s%N)
+          
+          # Collect post-Docker build metrics
+          free -m > metrics/system/post_docker_memory.txt
+          df -h > metrics/system/post_docker_disk.txt
+          top -b -n 1 > metrics/system/post_docker_resources.txt
+          
+          # Record Docker build time
+          echo "$((($end_time - $start_time)/1000000))" > metrics/performance/docker_time.txt
+          
+          # Collect Docker image size
+          docker images app:latest --format "{{.Size}}" > metrics/performance/docker_image_size.txt
+          
+          exit $build_status
+
+      - name: Collect final system metrics
+        if: always()
+        run: |
+          set -eo pipefail
+
+          # Collect final system metrics
+          echo "=== Final System Resources ===" > metrics/system/final_metrics.txt
+          top -b -n 1 >> metrics/system/final_metrics.txt || echo "Failed to collect top metrics"
+
+          echo "=== Final Memory Usage ===" > metrics/system/final_memory.txt
+          free -m >> metrics/system/final_memory.txt || echo "Failed to collect memory metrics"
+
+          echo "=== Final Disk Usage ===" > metrics/system/final_disk.txt
+          df -h >> metrics/system/final_disk.txt || echo "Failed to collect disk metrics"
+
+          # Mark pipeline end time
+          date +%s%N > metrics/pipeline_end_time.txt
+
+      - name: Save metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-metrics
+          path: metrics/
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker system prune -af
