@@ -14,48 +14,143 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup MSR monitoring
+      - name: Setup directories and install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y msr-tools linux-tools-common linux-tools-generic python3-pip
-          sudo modprobe msr
-          sudo chmod +r /dev/cpu/*/msr
-          pip3 install pandas numpy
-
-      - name: Create monitoring directories
-        run: |
+          set -eo pipefail
+          
+          # Structure des répertoires
           mkdir -p metrics/system
           mkdir -p metrics/power
           mkdir -p metrics/performance
-          mkdir -p metrics/memory
-          mkdir -p metrics/network
+          
+          # Installation des dépendances
+          sudo apt-get update
+          sudo apt-get install -y \
+            linux-tools-common \
+            linux-tools-generic \
+            python3-pip \
+            python3-psutil \
+            msr-tools
 
-      - name: Install RAPL monitor script
+          # Configuration MSR pour RAPL
+          sudo modprobe msr
+          sudo chmod +r /dev/cpu/*/msr || echo "Warning: Could not set MSR permissions"
+
+          # Installation dépendances Python
+          pip3 install pandas numpy
+
+      - name: Create energy monitoring script
         run: |
-          cat > rapl_monitor.py << 'EOL'
-          # [Le contenu du script RAPL monitor précédent ici]
+          cat > energy_monitor.py << 'EOL'
+          #!/usr/bin/env python3
+          import os
+          import sys
+          import time
+          import csv
+          from datetime import datetime
+
+          def monitor_energy(command, output_file):
+              """Monitore l'énergie via RAPL pendant l'exécution d'une commande"""
+              # Vérifier et configurer les chemins RAPL
+              rapl_base = "/sys/class/powercap/intel-rapl"
+              if not os.path.exists(rapl_base):
+                  print("RAPL non disponible", file=sys.stderr)
+                  return False
+
+              # Trouver tous les domaines RAPL disponibles
+              domains = {}
+              for domain in os.listdir(rapl_base):
+                  if domain.startswith("intel-rapl:"):
+                      domain_path = os.path.join(rapl_base, domain)
+                      name_path = os.path.join(domain_path, "name")
+                      energy_path = os.path.join(domain_path, "energy_uj")
+          
+                      if os.path.exists(energy_path):
+                          try:
+                              with open(name_path) as f:
+                                  name = f.read().strip()
+                              domains[domain] = {
+                                  "name": name,
+                                  "path": energy_path
+                              }
+                          except IOError:
+                              continue
+
+              if not domains:
+                  print("Aucun domaine RAPL trouvé", file=sys.stderr)
+                  return False
+
+              # Créer le fichier CSV
+              os.makedirs(os.path.dirname(output_file), exist_ok=True)
+              with open(output_file, 'w', newline='') as csvfile:
+                  writer = csv.writer(csvfile)
+                  writer.writerow(['Timestamp', 'Power_Watts', 'Component'])
+
+              # Lancer la commande
+              process = os.popen(command)
+          
+              # Initialiser les mesures
+              last_energy = {}
+              last_time = time.time()
+          
+              for domain in domains.values():
+                  try:
+                      with open(domain["path"]) as f:
+                          last_energy[domain["path"]] = int(f.read())
+                  except (IOError, ValueError):
+                      continue
+
+              # Boucle de monitoring
+              while process.close() is None:
+                  current_time = time.time()
+                  elapsed = current_time - last_time
+          
+                  if elapsed >= 1.0:  # Mesure chaque seconde
+                      with open(output_file, 'a', newline='') as csvfile:
+                          writer = csv.writer(csvfile)
+                          total_power = 0
+          
+                          for domain in domains.values():
+                              try:
+                                  with open(domain["path"]) as f:
+                                      current_energy = int(f.read())
+                                      if domain["path"] in last_energy:
+                                          # Convertir µJ en Watts
+                                          power = (current_energy - last_energy[domain["path"]]) / (elapsed * 1_000_000)
+                                          total_power += power
+                                      last_energy[domain["path"]] = current_energy
+                              except (IOError, ValueError):
+                                  continue
+          
+                          writer.writerow([
+                              datetime.now().isoformat(),
+                              round(total_power, 2),
+                              'System'
+                          ])
+          
+                      last_time = current_time
+                  time.sleep(0.1)
+
+              return True
+
+          def main():
+              if len(sys.argv) < 3:
+                  print("Usage: python energy_monitor.py 'command' output_file.csv")
+                  sys.exit(1)
+
+              command = sys.argv[1]
+              output_file = sys.argv[2]
+          
+              success = monitor_energy(command, output_file)
+              if not success:
+                  print("Échec du monitoring énergétique", file=sys.stderr)
+                  sys.exit(1)
+
+          if __name__ == '__main__':
+              main()
           EOL
-          chmod +x rapl_monitor.py
-
-      - name: Collect initial system state
-        run: |
-          echo "=== System Information ===" > metrics/system/system_info.txt
-          lscpu >> metrics/system/system_info.txt
-          cat /proc/cpuinfo >> metrics/system/system_info.txt
           
-          echo "=== Initial Memory State ===" > metrics/memory/initial_memory.txt
-          free -m >> metrics/memory/initial_memory.txt
-          vmstat -s >> metrics/memory/initial_memory.txt
-          
-          echo "=== Network Interfaces ===" > metrics/network/interfaces.txt
-          ip addr >> metrics/network/interfaces.txt
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-          cache: maven
+          chmod +x energy_monitor.py
 
       - name: Cache Maven packages
         uses: actions/cache@v3
@@ -64,95 +159,129 @@ jobs:
           key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
           restore-keys: ${{ runner.os }}-m2
 
-      - name: Build with Maven and monitor resources
+      - name: Collect initial system metrics
         run: |
-          # Démarrage monitoring réseau
-          sar -n DEV 1 > metrics/network/build_network.txt &
-          SAR_PID=$!
+          set -eo pipefail
           
-          # Démarrage monitoring IO
-          iostat 1 > metrics/system/build_io.txt &
-          IOSTAT_PID=$!
+          # Enregistrer le temps de début
+          date +%s%N > metrics/pipeline_start_time.txt
+          
+          # Collecter les métriques initiales
+          echo "=== Initial System Resources ===" > metrics/system/initial_metrics.txt
+          top -b -n 1 >> metrics/system/initial_metrics.txt
+          
+          echo "=== Initial Memory Usage ===" > metrics/system/initial_memory.txt
+          free -m >> metrics/system/initial_memory.txt
+          
+          echo "=== Initial Disk Usage ===" > metrics/system/initial_disk.txt
+          df -h >> metrics/system/initial_disk.txt
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'adopt'
+          cache: maven
+
+      - name: Build with Maven and measure energy
+        id: build
+        timeout-minutes: 15
+        env:
+          MAVEN_OPTS: "-Xmx2048m -XX:+TieredCompilation -XX:TieredStopAtLevel=1"
+        run: |
+          set -eo pipefail
+          
+          start_time=$(date +%s%N)
+          free -m > metrics/system/pre_build_memory.txt
           
           # Build avec monitoring RAPL
-          START_TIME=$(date +%s)
-          sudo python3 rapl_monitor.py \
-            "./mvnw -B verify -DskipTests" \
+          sudo python3 energy_monitor.py \
+            "./mvnw -B verify -Dmaven.test.skip=true -Dcheckstyle.skip=true -T 1C" \
             metrics/power/build_power_metrics.csv
-          END_TIME=$(date +%s)
           
-          # Arrêt monitoring
-          kill $SAR_PID $IOSTAT_PID
+          build_status=$?
+          end_time=$(date +%s%N)
           
-          # Calcul durée
-          echo $((END_TIME - START_TIME)) > metrics/performance/build_duration.txt
+          free -m > metrics/system/post_build_memory.txt
+          echo "$((($end_time - $start_time)/1000000))" > metrics/performance/build_time.txt
+          
+          exit $build_status
 
-      - name: Run tests with monitoring
+      - name: Run tests with energy monitoring
+        id: test
+        if: success()
+        timeout-minutes: 20
         run: |
-          # Démarrage monitoring
-          sar -n DEV 1 > metrics/network/test_network.txt &
-          SAR_PID=$!
+          set -eo pipefail
           
-          START_TIME=$(date +%s)
-          sudo python3 rapl_monitor.py \
-            "./mvnw test" \
+          start_time=$(date +%s%N)
+          free -m > metrics/system/pre_test_memory.txt
+          
+          # Tests avec monitoring RAPL
+          sudo python3 energy_monitor.py \
+            "./mvnw test -T 1C" \
             metrics/power/test_power_metrics.csv
-          END_TIME=$(date +%s)
           
-          # Arrêt monitoring
-          kill $SAR_PID
+          test_status=$?
+          end_time=$(date +%s%N)
           
-          # Métriques de test
-          echo $((END_TIME - START_TIME)) > metrics/performance/test_duration.txt
+          free -m > metrics/system/post_test_memory.txt
+          echo "$((($end_time - $start_time)/1000000))" > metrics/performance/test_time.txt
           
-          # Collecter résultats tests
-          find . -name "TEST-*.xml" -exec cp {} metrics/performance/ \;
+          exit $test_status
 
-      - name: Build Docker image with monitoring
+      - name: Build Docker image with energy monitoring
+        id: docker-build
+        if: success()
+        timeout-minutes: 10
         run: |
-          START_TIME=$(date +%s)
+          set -eo pipefail
           
-          # Monitoring disque pré-build
+          start_time=$(date +%s%N)
+          
+          free -m > metrics/system/pre_docker_memory.txt
           df -h > metrics/system/pre_docker_disk.txt
           
-          # Build avec monitoring énergétique
-          sudo python3 rapl_monitor.py \
-            "docker build -t app:latest ." \
-            metrics/power/docker_power_metrics.csv
+          # Build Docker avec monitoring RAPL
+          sudo python3 energy_monitor.py \
+            "docker build -t app:latest -f .devcontainer/Dockerfile . --no-cache" \
+            metrics/power/docker_build_power_metrics.csv
           
-          END_TIME=$(date +%s)
+          build_status=$?
+          end_time=$(date +%s%N)
           
-          # Métriques post-build
+          free -m > metrics/system/post_docker_memory.txt
           df -h > metrics/system/post_docker_disk.txt
-          docker images app:latest --format "{{.Size}}" > metrics/performance/docker_size.txt
-          echo $((END_TIME - START_TIME)) > metrics/performance/docker_duration.txt
+          
+          echo "$((($end_time - $start_time)/1000000))" > metrics/performance/docker_time.txt
+          docker images app:latest --format "{{.Size}}" > metrics/performance/docker_image_size.txt
+          
+          exit $build_status
 
-      - name: Generate metrics summary
+      - name: Collect final system metrics
         if: always()
         run: |
-          {
-            echo "=== Performance Summary ==="
-            echo "Build duration: $(cat metrics/performance/build_duration.txt) seconds"
-            echo "Test duration: $(cat metrics/performance/test_duration.txt) seconds"
-            echo "Docker build duration: $(cat metrics/performance/docker_duration.txt) seconds"
-            echo "Docker image size: $(cat metrics/performance/docker_size.txt)"
-          
-            echo -e "\n=== Resource Usage ==="
-            echo "Peak memory usage: $(cat metrics/memory/initial_memory.txt | grep "used" | head -n1)"
-          
-            echo -e "\n=== Power Consumption ==="
-            echo "Build phase average power: $(python3 -c 'import pandas as pd; df=pd.read_csv("metrics/power/build_power_metrics.csv"); print(f"{df.Power_Watts.mean():.2f} Watts")')"
-            echo "Test phase average power: $(python3 -c 'import pandas as pd; df=pd.read_csv("metrics/power/test_power_metrics.csv"); print(f"{df.Power_Watts.mean():.2f} Watts")')"
-            echo "Docker build average power: $(python3 -c 'import pandas as pd; df=pd.read_csv("metrics/power/docker_power_metrics.csv"); print(f"{df.Power_Watts.mean():.2f} Watts")')"
-          } > metrics/summary.txt
+          set -eo pipefail
 
-      - name: Upload metrics
+          echo "=== Final System Resources ===" > metrics/system/final_metrics.txt
+          top -b -n 1 >> metrics/system/final_metrics.txt || echo "Failed to collect top metrics"
+
+          echo "=== Final Memory Usage ===" > metrics/system/final_memory.txt
+          free -m >> metrics/system/final_memory.txt || echo "Failed to collect memory metrics"
+
+          echo "=== Final Disk Usage ===" > metrics/system/final_disk.txt
+          df -h >> metrics/system/final_disk.txt || echo "Failed to collect disk metrics"
+
+          date +%s%N > metrics/pipeline_end_time.txt
+
+      - name: Save metrics
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: pipeline-metrics
           path: metrics/
           retention-days: 90
+          if-no-files-found: warn
 
       - name: Cleanup
         if: always()
