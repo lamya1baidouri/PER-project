@@ -327,6 +327,7 @@ jobs:
                 curl --retry 3 --retry-delay 2 --max-time 10 --silent --show-error \
                   --data-binary @- http://localhost:9091/metrics/job/petclinic-pipeline || \
                 echo "::warning::Failed to export ${metric_name} for ${stage}"
+            fi
           }
           
           # Export des métriques de durée
