@@ -1,113 +1,127 @@
-name: Green IT Optimized Java Pipeline
+name: Green IT Metrics with Energy Estimation
 
 on:
   push:
-    branches: [ pipeline-optimization ]
+    branches: [ main, develop ]
   pull_request:
-    branches: [ pipeline-optimization ]
+    branches: [ main, develop ]
 
 jobs:
-  build-with-green-metrics:
+  collect-metrics:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-
-    services:
-      prometheus:
-        image: prom/prometheus:latest
-        ports:
-          - 9090:9090
-
-      pushgateway:
-        image: prom/pushgateway:latest
-        ports:
-          - 9091:9091
-
-      power-usage-exporter:
-        image: custom/power-usage-exporter:latest
-        ports:
-          - 9102:9102
 
     steps:
-      # Existing checkout and cache steps...
+      # Étapes précédentes...
 
-      - name: Setup monitoring tools
-        id: setup-monitoring
+      - name: Install Energy Estimation Tools
         run: |
-          # Configuration existante...
+          # Installation de Cloud Carbon Footprint
+          npm install @cloud-carbon-footprint/core
+          npm install @cloud-carbon-footprint/app
           
-          # Installation de powertop pour les métriques de consommation
-          sudo apt-get update && sudo apt-get install -y powertop
-          
-          # Démarrage de la collecte des métriques énergétiques
-          sudo powertop --csv=power_metrics.csv --time=60 &
-          echo "POWERTOP_PID=$!" >> $GITHUB_ENV
+          # Installation de scaphandre si disponible
+          if command -v docker &> /dev/null; then
+            docker pull hubblo/scaphandre:latest
+            docker run -d --privileged --name scaphandre hubblo/scaphandre:latest
+          fi
 
-      - name: Maven Build with Energy Metrics
-        id: maven
+      - name: Build with Energy Metrics
+        id: build
         run: |
-          # Métriques de build existantes...
+          # Capture du début
+          BUILD_START=$(date +%s%N)
           
-          # Collecte des métriques énergétiques pendant le build
-          start_power=$(cat /sys/class/power_supply/BAT0/power_now 2>/dev/null || echo "0")
+          # Monitoring des ressources détaillé
+          mkdir -p metrics/resources
           
-          ./mvnw -B verify
+          # Monitoring CPU pendant le build
+          (
+            while true; do
+              mpstat 1 1 | tail -n 1 >> metrics/resources/cpu_detailed.txt
+              sleep 5
+            done
+          ) &
+          MPSTAT_PID=$!
           
-          end_power=$(cat /sys/class/power_supply/BAT0/power_now 2>/dev/null || echo "0")
-          power_consumed=$((end_power - start_power))
-          echo "BUILD_POWER_CONSUMPTION=$power_consumed" >> $GITHUB_ENV
+          # Monitoring mémoire
+          (
+            while true; do
+              free -m >> metrics/resources/memory_detailed.txt
+              sleep 5
+            done
+          ) &
+          FREE_PID=$!
+          
+          # Exécution du build
+          mvn -B package
+          
+          # Arrêt du monitoring
+          kill $MPSTAT_PID $FREE_PID
+          
+          # Capture de la fin
+          BUILD_END=$(date +%s%N)
+          BUILD_DURATION=$((($BUILD_END - $BUILD_START)/1000000))
+          echo "BUILD_DURATION=${BUILD_DURATION}" >> $GITHUB_ENV
 
-      - name: Analyze Container Size
-        id: container-analysis
+      - name: Calculate Energy Estimations
         run: |
-          # Analyse de la taille des couches
-          docker history --no-trunc --format "{{.Size}}\t{{.CreatedBy}}" app:latest > image_layers.txt
+          # Fonction pour estimer la consommation énergétique
+          calculate_energy() {
+            local cpu_usage=$1
+            local duration_ms=$2
+            local memory_mb=$3
           
-          # Calcul de la taille totale
-          total_size=$(docker image ls app:latest --format "{{.Size}}")
-          echo "CONTAINER_SIZE=$total_size" >> $GITHUB_ENV
-
-      - name: Export Green IT Metrics
-        if: always()
-        run: |
-          export_metric() {
-            echo "${1}{stage=\"${3}\",project=\"petclinic\"} ${2}" | \
-            curl --data-binary @- http://localhost:9091/metrics/job/green-metrics
+            # Facteurs de conversion approximatifs
+            # Basés sur des moyennes de consommation de serveurs modernes
+            local CPU_WATTS_PER_PERCENT=2.5
+            local MEMORY_WATTS_PER_GB=2.0
+          
+            # Calcul CPU
+            local cpu_energy=$(echo "$cpu_usage * $CPU_WATTS_PER_PERCENT * $duration_ms / 1000" | bc)
+          
+            # Calcul mémoire
+            local memory_gb=$(echo "$memory_mb / 1024" | bc -l)
+            local memory_energy=$(echo "$memory_gb * $MEMORY_WATTS_PER_GB * $duration_ms / 1000" | bc)
+          
+            # Total en watt-secondes
+            echo "$cpu_energy + $memory_energy" | bc
           }
           
-          # Métriques existantes...
+          # Récupération des moyennes
+          AVG_CPU=$(awk '{ sum += $1 } END { print sum/NR }' metrics/resources/cpu_detailed.txt)
+          AVG_MEM=$(awk '{ sum += $3 } END { print sum/NR }' metrics/resources/memory_detailed.txt)
           
-          # Nouvelles métriques Green IT
-          export_metric "pipeline_power_consumption_watts" "${BUILD_POWER_CONSUMPTION}" "build"
-          export_metric "container_size_bytes" "${CONTAINER_SIZE}" "container"
+          # Calcul de l'estimation
+          ENERGY_ESTIMATE=$(calculate_energy $AVG_CPU $BUILD_DURATION $AVG_MEM)
+          echo "ENERGY_ESTIMATE=${ENERGY_ESTIMATE}" >> $GITHUB_ENV
           
-          # Métriques de cache
-          cache_hit_rate=$(grep -c "from cache" image_layers.txt)
-          export_metric "cache_hit_rate" "$cache_hit_rate" "cache"
-          
-          # Métriques de parallélisation
-          parallel_jobs=$(grep -c "parallel" .mvn/maven.config || echo "1")
-          export_metric "parallel_jobs_count" "$parallel_jobs" "parallelization"
+          # Estimation de l'empreinte carbone
+          # Basé sur la moyenne mondiale d'émissions de CO2 par kWh
+          CO2_FACTOR=0.475 # kg CO2 par kWh
+          CO2_ESTIMATE=$(echo "$ENERGY_ESTIMATE * $CO2_FACTOR / 3600000" | bc -l)
+          echo "CO2_ESTIMATE=${CO2_ESTIMATE}" >> $GITHUB_ENV
 
-      - name: Generate Energy Efficiency Report
+      - name: Generate Energy Report
         run: |
           {
-            echo "=== Green IT Metrics Report ===" > green_it_report.txt
-            echo "Build Power Consumption: ${BUILD_POWER_CONSUMPTION}W" >> green_it_report.txt
-            echo "Container Size: ${CONTAINER_SIZE}" >> green_it_report.txt
-            echo "Cache Hit Rate: ${cache_hit_rate}" >> green_it_report.txt
-            echo "Parallel Jobs: ${parallel_jobs}" >> green_it_report.txt
-          
-            echo "=== Power Usage Details ===" >> green_it_report.txt
-            cat power_metrics.csv >> green_it_report.txt
-          }
+            echo "=== Energy Consumption Estimates ==="
+            echo "Estimated Energy Usage: ${ENERGY_ESTIMATE} watt-secondes"
+            echo "Estimated CO2 Emissions: ${CO2_ESTIMATE} kg CO2e"
+            echo ""
+            echo "=== Resource Usage Details ==="
+            echo "Build Duration: ${BUILD_DURATION}ms"
+            echo "Average CPU Usage: ${AVG_CPU}%"
+            echo "Average Memory Usage: ${AVG_MEM}MB"
+            echo ""
+            echo "Note: Ces estimations sont basées sur des moyennes et des facteurs de conversion standard."
+          } > metrics/energy_report.txt
 
-      - name: Save Green IT Metrics
+      - name: Upload Energy Metrics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: green-it-metrics
+          name: green-it-energy-metrics
           path: |
-            green_it_report.txt
-            power_metrics.csv
-            image_layers.txt
-          retention-days: 90
+            metrics/energy_report.txt
+            metrics/resources/
+          retention-days: 30
