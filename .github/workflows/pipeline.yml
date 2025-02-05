@@ -2,9 +2,9 @@ name: Enhanced Java Application Pipeline with Metrics
 
 on:
   push:
-    branches: [ pipeline-optimization ]
+    branches: [ pipeline-nooptimization ]
   pull_request:
-    branches: [ pipeline-optimization ]
+    branches: [ pipeline-nooptimization ]
 
 jobs:
   build-with-metrics:
@@ -64,7 +64,7 @@ jobs:
           echo "::endgroup::"
           
           # Création des répertoires pour les métriques
-          mkdir -p metrics/resources metrics/energy
+          mkdir -p metrics/resources metrics/energy metrics/docker
           
           # Démarrage du monitoring détaillé
           (
@@ -159,10 +159,45 @@ jobs:
           set -eo pipefail
           start_time=$(date +%s%N)
           
+          # Build de l'image Docker
           docker build -t app:latest -f .devcontainer/Dockerfile . --no-cache
           build_status=$?
+          
+          # Collecter les métriques de l'image
+          echo "=== Image Docker Metrics ===" > metrics/docker/metrics.txt
+          
+          # Taille de l'image
+          docker images app:latest --format "{{.Size}}" >> metrics/docker/metrics.txt
+          IMAGE_SIZE=$(docker images app:latest --format "{{.Size}}" | sed 's/GB/*1024/;s/MB/*1/;s/kB/\/1024/' | bc)
+          echo "IMAGE_SIZE_MB=${IMAGE_SIZE}" >> $GITHUB_ENV
+          
+          # Nombres de layers
+          echo "Layers count:" >> metrics/docker/metrics.txt
+          docker history app:latest --format "{{.Size}}" | wc -l >> metrics/docker/metrics.txt
+          LAYERS_COUNT=$(docker history app:latest --format "{{.Size}}" | wc -l)
+          echo "LAYERS_COUNT=${LAYERS_COUNT}" >> $GITHUB_ENV
+          
+          # Détails des layers
+          echo -e "\nLayers details:" >> metrics/docker/metrics.txt
+          docker history app:latest --format "table {{.Size}}\t{{.CreatedBy}}" >> metrics/docker/metrics.txt
+          
+          # Vulnérabilités (si trivy est disponible)
+          if command -v trivy &> /dev/null; then
+            echo -e "\nVulnerability scan:" >> metrics/docker/metrics.txt
+            trivy image app:latest >> metrics/docker/metrics.txt
+          fi
+          
+          # Information sur les ports exposés et volumes
+          echo -e "\nImage config:" >> metrics/docker/metrics.txt
+          docker inspect app:latest >> metrics/docker/metrics.txt
+          
           end_time=$(date +%s%N)
           echo "DOCKER_BUILD_TIME=$((($end_time - $start_time)/1000000))" >> $GITHUB_ENV
+          
+          # Export des métriques Docker vers Prometheus
+          echo "docker_image_size_mb{image=\"app\",tag=\"latest\"} ${IMAGE_SIZE}" | curl --data-binary @- http://localhost:9091/metrics/job/docker-metrics
+          echo "docker_image_layers_count{image=\"app\",tag=\"latest\"} ${LAYERS_COUNT}" | curl --data-binary @- http://localhost:9091/metrics/job/docker-metrics
+          
           exit $build_status
 
       - name: Setup Kubernetes
@@ -266,6 +301,8 @@ jobs:
             echo "=== Build Phase ==="
             echo "Average CPU Usage: ${AVG_CPU_BUILD}%"
             echo "Average Memory Usage: ${AVG_MEM_BUILD}MB"
+            echo "Docker Image Size: ${IMAGE_SIZE_MB}MB"
+            echo "Docker Layers Count: ${LAYERS_COUNT}"
             echo ""
             echo "=== Test Phase ==="
             echo "Average CPU Usage: ${AVG_CPU_TEST}%"
@@ -290,7 +327,6 @@ jobs:
                 curl --retry 3 --retry-delay 2 --max-time 10 --silent --show-error \
                   --data-binary @- http://localhost:9091/metrics/job/petclinic-pipeline || \
                 echo "::warning::Failed to export ${metric_name} for ${stage}"
-            fi
           }
           
           # Export des métriques de durée
@@ -305,70 +341,6 @@ jobs:
           export_metric "pipeline_total_energy_consumption_ws" "${TOTAL_ENERGY}" "total"
           export_metric "pipeline_co2_emissions_kg" "${CO2_ESTIMATE}" "total"
 
-      - name: Collect resource metrics
-        if: always()
-        timeout-minutes: 2
-        run: |
-          set -eo pipefail
-          
-          export_metric() {
-            local metric_name=$1
-            local metric_value=$2
-            local stage=$3
-          
-            if [ -n "$metric_value" ]; then
-              echo "${metric_name}{stage=\"${stage}\",project=\"petclinic\"} ${metric_value}" | \
-                curl --retry 3 --retry-delay 2 --max-time 10 --silent --show-error \
-                  --data-binary @- http://localhost:9091/metrics/job/petclinic-pipeline || \
-                echo "::warning::Failed to export ${metric_name} for ${stage}"
-            fi
-          }
-          
-          mem_usage=$(free -b | grep Mem: | awk '{print $3}') || echo "::warning::Failed to collect memory usage"
-          if [ -n "$mem_usage" ]; then
-            export_metric "pipeline_memory_usage_bytes" "$mem_usage" "memory"
-          fi
-          
-          cpu_usage=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}') || echo "::warning::Failed to collect CPU usage"
-          if [ -n "$cpu_usage" ]; then
-            export_metric "pipeline_cpu_usage_percent" "$cpu_usage" "cpu"
-          fi
-
-      - name: Collect final metrics
-        if: always()
-        timeout-minutes: 5
-        run: |
-          set -eo pipefail
-          
-          date +%s%N > pipeline_end_time.txt
-          
-          if [ -n "$NODE_EXPORTER_PID" ]; then
-            kill $NODE_EXPORTER_PID || echo "::warning::Failed to stop node exporter"
-          fi
-          
-          if [ -n "$MPSTAT_PID" ]; then
-            kill $MPSTAT_PID || echo "::warning::Failed to stop mpstat"
-          fi
-          
-          if [ -n "$FREE_PID" ]; then
-            kill $FREE_PID || echo "::warning::Failed to stop free"
-          fi
-          
-          {
-            echo "=== System Resources ===" > system_metrics.txt
-            top -b -n 1 >> system_metrics.txt
-          } || echo "::warning::Failed to collect top metrics"
-          
-          {
-            echo "=== Memory Usage ===" > memory_metrics.txt
-            free -m >> memory_metrics.txt
-          } || echo "::warning::Failed to collect memory metrics"
-          
-          {
-            echo "=== Disk Usage ===" > disk_metrics.txt
-            df -h >> disk_metrics.txt
-          } || echo "::warning::Failed to collect disk metrics"
-
       - name: Save metrics
         if: always()
         uses: actions/upload-artifact@v4
@@ -378,6 +350,7 @@ jobs:
             metrics/energy/energy_report.txt
             metrics/resources/
             metrics/energy/
+            metrics/docker/
             system_metrics.txt
             memory_metrics.txt
             disk_metrics.txt
