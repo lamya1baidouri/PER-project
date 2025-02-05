@@ -2,9 +2,9 @@ name: Green IT Metrics with Energy Estimation
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [pipeline-optimization]
   pull_request:
-    branches: [ main, develop ]
+    branches: [ pipeline-optimization]
 
 jobs:
   collect-metrics:
