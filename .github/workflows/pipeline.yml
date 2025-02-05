@@ -1,15 +1,15 @@
-name: Optimized Java Pipeline with Energy Metrics
+name: Enhanced Java Application Pipeline with Metrics
 
 on:
   push:
-    branches: [ pipeline-optimization, main, develop ]
+    branches: [ pipeline-optimization ]
   pull_request:
-    branches: [ pipeline-optimization, main, develop ]
+    branches: [ pipeline-optimization ]
 
 jobs:
   build-with-metrics:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     services:
       prometheus:
@@ -26,32 +26,60 @@ jobs:
         image: prom/pushgateway:latest
         ports:
           - 9091:9091
+        options: >-
+          --health-cmd "wget -q -O- http://localhost:9091/-/healthy || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 3
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
-      - name: Install Energy Estimation Tools
+      - name: Setup monitoring tools
+        id: setup-monitoring
+        timeout-minutes: 5
         run: |
-          # Installation de Cloud Carbon Footprint
-          npm install @cloud-carbon-footprint/core
-          npm install @cloud-carbon-footprint/app
+          set -eo pipefail
           
-          # Installation de scaphandre si disponible
-          if command -v docker &> /dev/null; then
-            docker pull hubblo/scaphandre:latest
-            docker run -d --privileged --name scaphandre hubblo/scaphandre:latest
-          fi
+          echo "::group::Installing system packages"
+          sudo apt-get update || (echo "Failed to update package lists" && exit 1)
+          sudo apt-get install -y powerstat linux-tools-common linux-tools-generic || (echo "Failed to install powerstat and linux tools" && exit 1)
+          echo "::endgroup::"
+          
+          echo "::group::Setting up node exporter"
+          curl -L --retry 3 https://github.com/prometheus/node_exporter/releases/download/v1.3.1/node_exporter-1.3.1.linux-amd64.tar.gz -o node_exporter.tar.gz || (echo "Failed to download node exporter" && exit 1)
+          tar xvfz node_exporter.tar.gz || (echo "Failed to extract node exporter" && exit 1)
+          echo "::endgroup::"
 
-      - name: Cache Node Exporter
-        uses: actions/cache@v3
-        with:
-          path: node_exporter.tar.gz
-          key: node-exporter-1.3.1
-
-      - name: Create checkstyle config
+      - name: Start monitoring
+        id: start-monitoring
+        timeout-minutes: 2
         run: |
+          set -eo pipefail
+          
+          ./node_exporter-*/node_exporter --web.listen-address=":9100" &
+          echo "NODE_EXPORTER_PID=$!" >> $GITHUB_ENV
+          
+          timeout 30s bash -c 'until curl -s http://localhost:9100/metrics > /dev/null; do sleep 1; done' || (echo "Node exporter failed to start" && exit 1)
+          
+          date +%s%N > pipeline_start_time.txt
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'adopt'
+          cache: maven
+
+      - name: Build with Maven
+        id: build
+        timeout-minutes: 15
+        env:
+          MAVEN_OPTS: "-Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn"
+        run: |
+          set -eo pipefail
+          
+          echo "Creating checkstyle suppressions file..."
           cat > checkstyle-suppressions.xml << 'EOF'
           <?xml version="1.0"?>
           <!DOCTYPE suppressions PUBLIC
@@ -61,174 +89,171 @@ jobs:
             <suppress files="node_exporter.*" checks="NoHttp"/>
           </suppressions>
           EOF
-
+          
+          echo "Modifying checkstyle configuration..."
           if [ -f "src/checkstyle/nohttp-checkstyle.xml" ]; then
             sed -i '/<module name="Checker">/a \    <module name="SuppressionFilter">\n      <property name="file" value="${config_loc}/checkstyle-suppressions.xml"/>\n    </module>' src/checkstyle/nohttp-checkstyle.xml
           fi
-
-      - name: Setup monitoring tools
-        id: setup-monitoring
-        timeout-minutes: 3
-        run: |
-          set -eo pipefail
-          if [ ! -f node_exporter.tar.gz ]; then
-            curl -L --retry 3 https://github.com/prometheus/node_exporter/releases/download/v1.3.1/node_exporter-1.3.1.linux-amd64.tar.gz -o node_exporter.tar.gz
-          fi
-          tar xf node_exporter.tar.gz
-          ./node_exporter-*/node_exporter --web.listen-address=":9100" &
-          echo "NODE_EXPORTER_PID=$!" >> $GITHUB_ENV
           
-          # Création des répertoires pour les métriques
-          mkdir -p metrics/resources
+          echo "Starting Maven build..."
+          start_time=$(date +%s%N)
           
-          # Démarrage du monitoring détaillé
-          (
-            while true; do
-              mpstat 1 1 | tail -n 1 >> metrics/resources/cpu_detailed.txt
-              sleep 5
-            done
-          ) &
-          echo "MPSTAT_PID=$!" >> $GITHUB_ENV
-          
-          (
-            while true; do
-              free -m >> metrics/resources/memory_detailed.txt
-              sleep 5
-            done
-          ) &
-          echo "FREE_PID=$!" >> $GITHUB_ENV
-          
-          date +%s%N > pipeline_start_time.txt
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'adopt'
-          cache: 'maven'
-
-      - name: Maven Build and Test
-        id: maven
-        timeout-minutes: 25
-        env:
-          MAVEN_OPTS: "-Xmx2g -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn"
-        run: |
-          set -eo pipefail
-          
-          # Capture du début
-          BUILD_START=$(date +%s%N)
-          
-          # Build
-          ./mvnw -B verify -DskipTests \
+          ./mvnw -B verify \
             -Dcheckstyle.config.location=src/checkstyle/nohttp-checkstyle.xml \
-            -Dcheckstyle.suppressions.location=checkstyle-suppressions.xml \
-            -Dconfig_loc=.
+            -Dcheckstyle.suppressions.location=checkstyle-suppressions.xml
           
-          # Capture de la fin du build
-          BUILD_END=$(date +%s%N)
-          BUILD_DURATION=$((($BUILD_END - $BUILD_START)/1000000))
-          echo "BUILD_DURATION=${BUILD_DURATION}" >> $GITHUB_ENV
+          build_status=$?
+          end_time=$(date +%s%N)
+          echo "BUILD_TIME=$((($end_time - $start_time)/1000000))" >> $GITHUB_ENV
           
-          # Tests
-          TEST_START=$(date +%s%N)
-          ./mvnw -B test
-          TEST_END=$(date +%s%N)
-          TEST_DURATION=$((($TEST_END - $TEST_START)/1000000))
-          echo "TEST_DURATION=${TEST_DURATION}" >> $GITHUB_ENV
+          if [ $build_status -ne 0 ]; then
+            echo "::error::Maven build failed with status $build_status"
+            exit $build_status
+          fi
 
-      - name: Calculate Energy Metrics
+      - name: Run tests
+        id: test
+        if: success() || failure()
+        timeout-minutes: 20
         run: |
-          # Fonction pour estimer la consommation énergétique
-          calculate_energy() {
-            local cpu_usage=$1
-            local duration_ms=$2
-            local memory_mb=$3
-          
-            # Facteurs de conversion approximatifs
-            local CPU_WATTS_PER_PERCENT=2.5
-            local MEMORY_WATTS_PER_GB=2.0
-          
-            # Calcul CPU
-            local cpu_energy=$(echo "$cpu_usage * $CPU_WATTS_PER_PERCENT * $duration_ms / 1000" | bc)
-          
-            # Calcul mémoire
-            local memory_gb=$(echo "$memory_mb / 1024" | bc -l)
-            local memory_energy=$(echo "$memory_gb * $MEMORY_WATTS_PER_GB * $duration_ms / 1000" | bc)
-          
-            # Total en watt-secondes
-            echo "$cpu_energy + $memory_energy" | bc
-          }
-          
-          # Calcul pour le build
-          AVG_CPU_BUILD=$(awk '{ sum += $1 } END { print sum/NR }' metrics/resources/cpu_detailed.txt)
-          AVG_MEM_BUILD=$(awk '{ sum += $3 } END { print sum/NR }' metrics/resources/memory_detailed.txt)
-          BUILD_ENERGY=$(calculate_energy $AVG_CPU_BUILD $BUILD_DURATION $AVG_MEM_BUILD)
-          
-          # Calcul pour les tests
-          AVG_CPU_TEST=$(awk '{ sum += $1 } END { print sum/NR }' metrics/resources/cpu_detailed.txt)
-          AVG_MEM_TEST=$(awk '{ sum += $3 } END { print sum/NR }' metrics/resources/memory_detailed.txt)
-          TEST_ENERGY=$(calculate_energy $AVG_CPU_TEST $TEST_DURATION $AVG_MEM_TEST)
-          
-          # Total
-          TOTAL_ENERGY=$(echo "$BUILD_ENERGY + $TEST_ENERGY" | bc)
-          echo "TOTAL_ENERGY=${TOTAL_ENERGY}" >> $GITHUB_ENV
-          
-          # Estimation CO2
-          CO2_FACTOR=0.475 # kg CO2 par kWh
-          CO2_ESTIMATE=$(echo "$TOTAL_ENERGY * $CO2_FACTOR / 3600000" | bc -l)
-          echo "CO2_ESTIMATE=${CO2_ESTIMATE}" >> $GITHUB_ENV
+          set -eo pipefail
+          start_time=$(date +%s%N)
+          ./mvnw test
+          test_status=$?
+          end_time=$(date +%s%N)
+          echo "TEST_TIME=$((($end_time - $start_time)/1000000))" >> $GITHUB_ENV
+          exit $test_status
 
-      - name: Export Energy Metrics
+      - name: Build Docker image
+        id: docker-build
+        if: success()
+        timeout-minutes: 10
         run: |
-          export_metric() {
-            echo "${1}{stage=\"${3}\",project=\"petclinic\"} ${2}" | \
-            curl --retry 3 -s --data-binary @- http://localhost:9091/metrics/job/pipeline_energy
-          }
+          set -eo pipefail
+          start_time=$(date +%s%N)
           
-          export_metric "pipeline_energy_consumption_ws" "${BUILD_ENERGY}" "build"
-          export_metric "pipeline_energy_consumption_ws" "${TEST_ENERGY}" "test"
-          export_metric "pipeline_co2_emissions_kg" "${CO2_ESTIMATE}" "total"
-          
-          # Génération du rapport
-          {
-            echo "=== Energy Consumption Report ==="
-            echo "Build Energy Usage: ${BUILD_ENERGY} watt-secondes"
-            echo "Test Energy Usage: ${TEST_ENERGY} watt-secondes"
-            echo "Total Energy Usage: ${TOTAL_ENERGY} watt-secondes"
-            echo "Estimated CO2 Emissions: ${CO2_ESTIMATE} kg CO2e"
-            echo ""
-            echo "=== Performance Metrics ==="
-            echo "Build Duration: ${BUILD_DURATION}ms"
-            echo "Test Duration: ${TEST_DURATION}ms"
-            echo ""
-            echo "Note: Ces estimations sont basées sur des facteurs de conversion standard."
-          } > metrics/energy_report.txt
+          docker build -t app:latest -f .devcontainer/Dockerfile . --no-cache
+          build_status=$?
+          end_time=$(date +%s%N)
+          echo "DOCKER_BUILD_TIME=$((($end_time - $start_time)/1000000))" >> $GITHUB_ENV
+          exit $build_status
 
-      - name: Collect Final Metrics
+      - name: Setup Kubernetes
+        id: k8s-setup
+        if: success()
+        uses: helm/kind-action@v1
+        with:
+          wait: 120s
+
+      - name: Deploy to Kubernetes
+        id: deploy
+        if: success()
+        timeout-minutes: 10
+        run: |
+          set -eo pipefail
+          start_time=$(date +%s%N)
+          kubectl apply -f k8s/ || (echo "Failed to apply Kubernetes manifests" && exit 1)
+          
+          if ! kubectl wait --for=condition=ready pod -l app=petclinic --timeout=180s; then
+            echo "::error::Deployment failed - collecting debug information"
+            kubectl describe pods -l app=petclinic
+            kubectl logs -l app=petclinic --all-containers=true
+            exit 1
+          fi
+          
+          end_time=$(date +%s%N)
+          echo "DEPLOY_TIME=$((($end_time - $start_time)/1000000))" >> $GITHUB_ENV
+
+      - name: Export metrics to Prometheus
         if: always()
         timeout-minutes: 5
         run: |
-          # Arrêt du monitoring
-          if [ -n "$MPSTAT_PID" ]; then
-            kill $MPSTAT_PID || echo "::warning::Failed to stop mpstat"
+          set -eo pipefail
+          
+          export_metric() {
+            local metric_name=$1
+            local metric_value=$2
+            local stage=$3
+          
+            if [ -n "$metric_value" ]; then
+              echo "${metric_name}{stage=\"${stage}\",project=\"petclinic\"} ${metric_value}" | \
+                curl --retry 3 --retry-delay 2 --max-time 10 --silent --show-error \
+                  --data-binary @- http://localhost:9091/metrics/job/petclinic-pipeline || \
+                echo "::warning::Failed to export ${metric_name} for ${stage}"
+            fi
+          }
+          
+          export_metric "pipeline_build_duration_ms" "${BUILD_TIME}" "build"
+          export_metric "pipeline_test_duration_ms" "${TEST_TIME}" "test"
+          export_metric "pipeline_docker_build_duration_ms" "${DOCKER_BUILD_TIME}" "docker-build"
+          export_metric "pipeline_deploy_duration_ms" "${DEPLOY_TIME}" "deploy"
+
+      - name: Collect resource metrics
+        if: always()
+        timeout-minutes: 2
+        run: |
+          set -eo pipefail
+          
+          export_metric() {
+            local metric_name=$1
+            local metric_value=$2
+            local stage=$3
+          
+            if [ -n "$metric_value" ]; then
+              echo "${metric_name}{stage=\"${stage}\",project=\"petclinic\"} ${metric_value}" | \
+                curl --retry 3 --retry-delay 2 --max-time 10 --silent --show-error \
+                  --data-binary @- http://localhost:9091/metrics/job/petclinic-pipeline || \
+                echo "::warning::Failed to export ${metric_name} for ${stage}"
+            fi
+          }
+          
+          mem_usage=$(free -b | grep Mem: | awk '{print $3}') || echo "::warning::Failed to collect memory usage"
+          if [ -n "$mem_usage" ]; then
+            export_metric "pipeline_memory_usage_bytes" "$mem_usage" "memory"
           fi
-          if [ -n "$FREE_PID" ]; then
-            kill $FREE_PID || echo "::warning::Failed to stop free"
+          
+          cpu_usage=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}') || echo "::warning::Failed to collect CPU usage"
+          if [ -n "$cpu_usage" ]; then
+            export_metric "pipeline_cpu_usage_percent" "$cpu_usage" "cpu"
           fi
+
+      - name: Collect final metrics
+        if: always()
+        timeout-minutes: 5
+        run: |
+          set -eo pipefail
+          
+          date +%s%N > pipeline_end_time.txt
+          
           if [ -n "$NODE_EXPORTER_PID" ]; then
             kill $NODE_EXPORTER_PID || echo "::warning::Failed to stop node exporter"
           fi
+          
+          {
+            echo "=== System Resources ===" > system_metrics.txt
+            top -b -n 1 >> system_metrics.txt
+          } || echo "::warning::Failed to collect top metrics"
+          
+          {
+            echo "=== Memory Usage ===" > memory_metrics.txt
+            free -m >> memory_metrics.txt
+          } || echo "::warning::Failed to collect memory metrics"
+          
+          {
+            echo "=== Disk Usage ===" > disk_metrics.txt
+            df -h >> disk_metrics.txt
+          } || echo "::warning::Failed to collect disk metrics"
 
-      - name: Upload Metrics
+      - name: Save metrics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pipeline-energy-metrics
+          name: pipeline-metrics
           path: |
-            metrics/energy_report.txt
-            metrics/resources/
             system_metrics.txt
             memory_metrics.txt
             disk_metrics.txt
+            pipeline_start_time.txt
+            pipeline_end_time.txt
           retention-days: 90
           if-no-files-found: warn
