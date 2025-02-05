@@ -218,20 +218,30 @@ jobs:
             echo "$cpu_energy + $memory_energy" | bc
           }
           
-          # Calcul des moyennes
-          AVG_CPU=$(awk '{ sum += $1 } END { print sum/NR }' metrics/resources/cpu_detailed.txt)
-          AVG_MEM=$(awk '{ sum += $3 } END { print sum/NR }' metrics/resources/memory_detailed.txt)
+          # Calcul des moyennes pour le build
+          AVG_CPU_BUILD=$(awk '{ sum += $1 } END { print sum/NR }' metrics/resources/cpu_detailed.txt)
+          AVG_MEM_BUILD=$(awk '{ sum += $3 } END { print sum/NR }' metrics/resources/memory_detailed.txt)
+          
+          # Calcul des moyennes pour les tests
+          AVG_CPU_TEST=$(awk '{ sum += $1 } END { print sum/NR }' metrics/resources/cpu_detailed.txt)
+          AVG_MEM_TEST=$(awk '{ sum += $3 } END { print sum/NR }' metrics/resources/memory_detailed.txt)
           
           # Calcul énergie pour chaque phase
           if [ -n "${BUILD_TIME}" ]; then
-            BUILD_ENERGY=$(calculate_energy $AVG_CPU $BUILD_TIME $AVG_MEM)
+            BUILD_ENERGY=$(calculate_energy $AVG_CPU_BUILD $BUILD_TIME $AVG_MEM_BUILD)
             echo "BUILD_ENERGY=${BUILD_ENERGY}" >> $GITHUB_ENV
           fi
           
           if [ -n "${TEST_TIME}" ]; then
-            TEST_ENERGY=$(calculate_energy $AVG_CPU $TEST_TIME $AVG_MEM)
+            TEST_ENERGY=$(calculate_energy $AVG_CPU_TEST $TEST_TIME $AVG_MEM_TEST)
             echo "TEST_ENERGY=${TEST_ENERGY}" >> $GITHUB_ENV
           fi
+          
+          # Sauvegarder les moyennes pour le rapport
+          echo "AVG_CPU_BUILD=${AVG_CPU_BUILD}" >> $GITHUB_ENV
+          echo "AVG_MEM_BUILD=${AVG_MEM_BUILD}" >> $GITHUB_ENV
+          echo "AVG_CPU_TEST=${AVG_CPU_TEST}" >> $GITHUB_ENV
+          echo "AVG_MEM_TEST=${AVG_MEM_TEST}" >> $GITHUB_ENV
           
           # Total énergie
           TOTAL_ENERGY=$(echo "${BUILD_ENERGY:-0} + ${TEST_ENERGY:-0}" | bc)
@@ -253,8 +263,13 @@ jobs:
             echo "=== Resource Usage Details ==="
             echo "Build Duration: ${BUILD_TIME:-0}ms"
             echo "Test Duration: ${TEST_TIME:-0}ms"
-            echo "Average CPU Usage: ${AVG_CPU}%"
-            echo "Average Memory Usage: ${AVG_MEM}MB"
+            echo "=== Build Phase ==="
+            echo "Average CPU Usage: ${AVG_CPU_BUILD}%"
+            echo "Average Memory Usage: ${AVG_MEM_BUILD}MB"
+            echo ""
+            echo "=== Test Phase ==="
+            echo "Average CPU Usage: ${AVG_CPU_TEST}%"
+            echo "Average Memory Usage: ${AVG_MEM_TEST}MB"
             echo ""
             echo "Note: Ces estimations sont basées sur des moyennes et des facteurs de conversion standard."
           } > metrics/energy/energy_report.txt
