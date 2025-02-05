@@ -1,4 +1,4 @@
-name: Optimized Java Pipeline with Metrics
+name: Green IT Optimized Java Pipeline
 
 on:
   push:
@@ -7,247 +7,107 @@ on:
     branches: [ pipeline-optimization ]
 
 jobs:
-  build:
+  build-with-green-metrics:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    outputs:
-      build_time: ${{ steps.maven-build.outputs.build_time }}
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'adopt'
-          cache: 'maven'
-
-      - name: Create checkstyle config
-        run: |
-          cat > checkstyle-suppressions.xml << 'EOF'
-          <?xml version="1.0"?>
-          <!DOCTYPE suppressions PUBLIC
-            "-//Checkstyle//DTD SuppressionFilter Configuration 1.2//EN"
-            "https://checkstyle.org/dtds/suppressions_1_2.dtd">
-          <suppressions>
-            <suppress files="[\\/]target[\\/]" checks=".+"/>
-            <suppress files=".*" checks="NoHttp"/>
-          </suppressions>
-          EOF
-
-          if [ -f "src/checkstyle/nohttp-checkstyle.xml" ]; then
-            sed -i '/<module name="Checker">/a \    <module name="SuppressionFilter">\n      <property name="file" value="${config_loc}/checkstyle-suppressions.xml"/>\n    </module>' src/checkstyle/nohttp-checkstyle.xml
-          fi
-
-      - name: Maven Build
-        id: maven-build
-        timeout-minutes: 15
-        env:
-          MAVEN_OPTS: "-Xmx2g -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn"
-        run: |
-          build_start=$(date +%s%N)
-          ./mvnw -B verify -DskipTests \
-            -Dcheckstyle.config.location=src/checkstyle/nohttp-checkstyle.xml \
-            -Dcheckstyle.suppressions.location=checkstyle-suppressions.xml \
-            -Dcheckstyle.config.locationx=${PWD}/checkstyle-suppressions.xml
-          build_end=$(date +%s%N)
-          echo "build_time=$((($build_end - $build_start)/1000000))" >> $GITHUB_OUTPUT
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-artifacts
-          path: target/
-          retention-days: 1
-
-  test:
-    needs: build
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    strategy:
-      matrix:
-        test-group: [fast, slow]
-    outputs:
-      test_time: ${{ steps.run-tests.outputs.test_time }}
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'adopt'
-          cache: 'maven'
-
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: build-artifacts
-          path: target/
-
-      - name: Run Tests
-        id: run-tests
-        timeout-minutes: 20
-        env:
-          MAVEN_OPTS: "-Xmx2g"
-        run: |
-          test_start=$(date +%s%N)
-          if [ "${{ matrix.test-group }}" = "fast" ]; then
-            ./mvnw -B test -Dtest=FastTests -DfailIfNoTests=false
-          else
-            ./mvnw -B test -Dtest=SlowTests -Pparallel -DfailIfNoTests=false
-          fi
-          test_end=$(date +%s%N)
-          echo "test_time=$((($test_end - $test_start)/1000000))" >> $GITHUB_OUTPUT
-
-  docker:
-    needs: [build, test]
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: build-artifacts
-          path: target/
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: .devcontainer/Dockerfile
-          platforms: linux/amd64
-          tags: app:latest
-          push: false
-          build-args: |
-            MAVEN_OPTS="-Xmx2g"
-          outputs: type=docker
-          compress: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  deploy:
-    needs: docker
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 45
 
     services:
-      scaphandre:
-        image: hubblo/scaphandre:latest
-        options: >-
-          --privileged
-        volumes:
-          - /sys/class/powercap:/sys/class/powercap
-          - /proc:/proc
-
       prometheus:
         image: prom/prometheus:latest
         ports:
           - 9090:9090
-        options: >-
-          --health-cmd "wget -q -O- http://localhost:9090/-/healthy || exit 1"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 3
 
       pushgateway:
         image: prom/pushgateway:latest
         ports:
           - 9091:9091
 
+      power-usage-exporter:
+        image: custom/power-usage-exporter:latest
+        ports:
+          - 9102:9102
+
     steps:
-      - uses: actions/checkout@v4
+      # Existing checkout and cache steps...
 
-      - name: Setup and Deploy to K8s
-        id: deploy
-        timeout-minutes: 8
+      - name: Setup monitoring tools
+        id: setup-monitoring
         run: |
-          start_time=$(date +%s%N)
-          kind create cluster --wait 60s
-          kubectl apply -f k8s/
-          kubectl wait --for=condition=ready pod -l app=petclinic --timeout=120s
-          end_time=$(date +%s%N)
-          echo "DEPLOY_TIME=$((($end_time - $start_time)/1000000))" >> $GITHUB_ENV
+          # Configuration existante...
+          
+          # Installation de powertop pour les métriques de consommation
+          sudo apt-get update && sudo apt-get install -y powertop
+          
+          # Démarrage de la collecte des métriques énergétiques
+          sudo powertop --csv=power_metrics.csv --time=60 &
+          echo "POWERTOP_PID=$!" >> $GITHUB_ENV
 
-      - name: Install PowerAPI
+      - name: Maven Build with Energy Metrics
+        id: maven
         run: |
-          sudo apt-get update
-          sudo apt-get install -y python3-pip
-          pip3 install powerapi-cli
+          # Métriques de build existantes...
+          
+          # Collecte des métriques énergétiques pendant le build
+          start_power=$(cat /sys/class/power_supply/BAT0/power_now 2>/dev/null || echo "0")
+          
+          ./mvnw -B verify
+          
+          end_power=$(cat /sys/class/power_supply/BAT0/power_now 2>/dev/null || echo "0")
+          power_consumed=$((end_power - start_power))
+          echo "BUILD_POWER_CONSUMPTION=$power_consumed" >> $GITHUB_ENV
 
-      - name: Export metrics
+      - name: Analyze Container Size
+        id: container-analysis
+        run: |
+          # Analyse de la taille des couches
+          docker history --no-trunc --format "{{.Size}}\t{{.CreatedBy}}" app:latest > image_layers.txt
+          
+          # Calcul de la taille totale
+          total_size=$(docker image ls app:latest --format "{{.Size}}")
+          echo "CONTAINER_SIZE=$total_size" >> $GITHUB_ENV
+
+      - name: Export Green IT Metrics
         if: always()
         run: |
-          # Start energy monitoring
-          powerapi monitor 
           export_metric() {
             echo "${1}{stage=\"${3}\",project=\"petclinic\"} ${2}" | \
-            curl --retry 3 -s --data-binary @- http://localhost:9091/metrics/job/pipeline
+            curl --data-binary @- http://localhost:9091/metrics/job/green-metrics
           }
           
-          export_metric "pipeline_build_duration_ms" "${{ needs.build.outputs.build_time }}" "build"
-          export_metric "pipeline_test_duration_ms" "${{ needs.test.outputs.test_time }}" "test"
-          export_metric "pipeline_deploy_duration_ms" "${DEPLOY_TIME}" "deploy"
+          # Métriques existantes...
           
-          mem_usage=$(free -b | grep Mem: | awk '{print $3}')
-          cpu_usage=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}')
+          # Nouvelles métriques Green IT
+          export_metric "pipeline_power_consumption_watts" "${BUILD_POWER_CONSUMPTION}" "build"
+          export_metric "container_size_bytes" "${CONTAINER_SIZE}" "container"
           
-          export_metric "pipeline_memory_usage_bytes" "$mem_usage" "memory"
-          export_metric "pipeline_cpu_usage_percent" "$cpu_usage" "cpu"
+          # Métriques de cache
+          cache_hit_rate=$(grep -c "from cache" image_layers.txt)
+          export_metric "cache_hit_rate" "$cache_hit_rate" "cache"
           
-          # Energy metrics
-          if [ -f "/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj" ]; then
-            energy_start=$(cat /sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj)
-            sleep 1
-            energy_end=$(cat /sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj)
-            energy_consumed=$(( ($energy_end - $energy_start) / 1000000 ))  # Convert to millijoules
-            export_metric "pipeline_energy_consumption_mj" "$energy_consumed" "energy"
-          fi
-          
-          # Get power consumption from scaphandre if available
-          if curl -s localhost:8080/metrics > /dev/null; then
-            power_usage=$(curl -s localhost:8080/metrics | grep "scaph_host_power_microwatts" | awk '{print $2}')
-            export_metric "pipeline_power_consumption_watts" "$(echo $power_usage/1000000 | bc)" "power"
-          fi
+          # Métriques de parallélisation
+          parallel_jobs=$(grep -c "parallel" .mvn/maven.config || echo "1")
+          export_metric "parallel_jobs_count" "$parallel_jobs" "parallelization"
 
-      - name: Collect final metrics
-        if: always()
-        timeout-minutes: 5
+      - name: Generate Energy Efficiency Report
         run: |
           {
-            echo "=== System Resources ===" > system_metrics.txt
-            top -b -n 1 >> system_metrics.txt
-          } || echo "::warning::Failed to collect top metrics"
+            echo "=== Green IT Metrics Report ===" > green_it_report.txt
+            echo "Build Power Consumption: ${BUILD_POWER_CONSUMPTION}W" >> green_it_report.txt
+            echo "Container Size: ${CONTAINER_SIZE}" >> green_it_report.txt
+            echo "Cache Hit Rate: ${cache_hit_rate}" >> green_it_report.txt
+            echo "Parallel Jobs: ${parallel_jobs}" >> green_it_report.txt
           
-          {
-            echo "=== Memory Usage ===" > memory_metrics.txt
-            free -m >> memory_metrics.txt
-          } || echo "::warning::Failed to collect memory metrics"
-          
-          {
-            echo "=== Disk Usage ===" > disk_metrics.txt
-            df -h >> disk_metrics.txt
-          } || echo "::warning::Failed to collect disk metrics"
+            echo "=== Power Usage Details ===" >> green_it_report.txt
+            cat power_metrics.csv >> green_it_report.txt
+          }
 
-      - name: Save metrics
+      - name: Save Green IT Metrics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pipeline-metrics
+          name: green-it-metrics
           path: |
-            system_metrics.txt
-            memory_metrics.txt
-            disk_metrics.txt
-            energy_metrics.txt
+            green_it_report.txt
+            power_metrics.csv
+            image_layers.txt
           retention-days: 90
-          if-no-files-found: warn
