@@ -2,9 +2,9 @@ name: Enhanced Java Application Pipeline with Metrics
 
 on:
   push:
-    branches: [ pipeline-nooptimization ]
+    branches: [ pipeline-imageDockeroptimization ]
   pull_request:
-    branches: [ pipeline-nooptimization ]
+    branches: [pipeline-imageDockeroptimization ]
 
 jobs:
   build-with-metrics:
