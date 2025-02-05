@@ -35,6 +35,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Energy Estimation Tools
+        run: |
+          # Installation de Cloud Carbon Footprint
+          npm install @cloud-carbon-footprint/core
+          npm install @cloud-carbon-footprint/app
+          
+          # Installation de scaphandre si disponible
+          if command -v docker &> /dev/null; then
+            docker pull hubblo/scaphandre:latest
+            docker run -d --privileged --name scaphandre hubblo/scaphandre:latest
+          fi
+
       - name: Setup monitoring tools
         id: setup-monitoring
         timeout-minutes: 5
@@ -50,12 +62,26 @@ jobs:
           curl -L --retry 3 https://github.com/prometheus/node_exporter/releases/download/v1.3.1/node_exporter-1.3.1.linux-amd64.tar.gz -o node_exporter.tar.gz || (echo "Failed to download node exporter" && exit 1)
           tar xvfz node_exporter.tar.gz || (echo "Failed to extract node exporter" && exit 1)
           echo "::endgroup::"
-
-      - name: Start monitoring
-        id: start-monitoring
-        timeout-minutes: 2
-        run: |
-          set -eo pipefail
+          
+          # Création des répertoires pour les métriques
+          mkdir -p metrics/resources metrics/energy
+          
+          # Démarrage du monitoring détaillé
+          (
+            while true; do
+              mpstat 1 1 | tail -n 1 >> metrics/resources/cpu_detailed.txt
+              sleep 5
+            done
+          ) &
+          echo "MPSTAT_PID=$!" >> $GITHUB_ENV
+          
+          (
+            while true; do
+              free -m >> metrics/resources/memory_detailed.txt
+              sleep 5
+            done
+          ) &
+          echo "FREE_PID=$!" >> $GITHUB_ENV
           
           ./node_exporter-*/node_exporter --web.listen-address=":9100" &
           echo "NODE_EXPORTER_PID=$!" >> $GITHUB_ENV
@@ -100,7 +126,8 @@ jobs:
           
           ./mvnw -B verify \
             -Dcheckstyle.config.location=src/checkstyle/nohttp-checkstyle.xml \
-            -Dcheckstyle.suppressions.location=checkstyle-suppressions.xml
+            -Dcheckstyle.suppressions.location=checkstyle-suppressions.xml \
+            -Dconfig_loc=.
           
           build_status=$?
           end_time=$(date +%s%N)
@@ -164,6 +191,74 @@ jobs:
           end_time=$(date +%s%N)
           echo "DEPLOY_TIME=$((($end_time - $start_time)/1000000))" >> $GITHUB_ENV
 
+      - name: Calculate Energy Metrics
+        if: always()
+        timeout-minutes: 5
+        run: |
+          set -eo pipefail
+          
+          # Fonction pour estimer la consommation énergétique
+          calculate_energy() {
+            local cpu_usage=$1
+            local duration_ms=$2
+            local memory_mb=$3
+          
+            # Facteurs de conversion approximatifs
+            local CPU_WATTS_PER_PERCENT=2.5
+            local MEMORY_WATTS_PER_GB=2.0
+          
+            # Calcul CPU
+            local cpu_energy=$(echo "$cpu_usage * $CPU_WATTS_PER_PERCENT * $duration_ms / 1000" | bc)
+          
+            # Calcul mémoire
+            local memory_gb=$(echo "$memory_mb / 1024" | bc -l)
+            local memory_energy=$(echo "$memory_gb * $MEMORY_WATTS_PER_GB * $duration_ms / 1000" | bc)
+          
+            # Total en watt-secondes
+            echo "$cpu_energy + $memory_energy" | bc
+          }
+          
+          # Calcul des moyennes
+          AVG_CPU=$(awk '{ sum += $1 } END { print sum/NR }' metrics/resources/cpu_detailed.txt)
+          AVG_MEM=$(awk '{ sum += $3 } END { print sum/NR }' metrics/resources/memory_detailed.txt)
+          
+          # Calcul énergie pour chaque phase
+          if [ -n "${BUILD_TIME}" ]; then
+            BUILD_ENERGY=$(calculate_energy $AVG_CPU $BUILD_TIME $AVG_MEM)
+            echo "BUILD_ENERGY=${BUILD_ENERGY}" >> $GITHUB_ENV
+          fi
+          
+          if [ -n "${TEST_TIME}" ]; then
+            TEST_ENERGY=$(calculate_energy $AVG_CPU $TEST_TIME $AVG_MEM)
+            echo "TEST_ENERGY=${TEST_ENERGY}" >> $GITHUB_ENV
+          fi
+          
+          # Total énergie
+          TOTAL_ENERGY=$(echo "${BUILD_ENERGY:-0} + ${TEST_ENERGY:-0}" | bc)
+          echo "TOTAL_ENERGY=${TOTAL_ENERGY}" >> $GITHUB_ENV
+          
+          # Estimation CO2
+          CO2_FACTOR=0.475 # kg CO2 par kWh
+          CO2_ESTIMATE=$(echo "$TOTAL_ENERGY * $CO2_FACTOR / 3600000" | bc -l)
+          echo "CO2_ESTIMATE=${CO2_ESTIMATE}" >> $GITHUB_ENV
+
+          # Génération du rapport énergétique détaillé
+          {
+            echo "=== Energy Consumption Estimates ==="
+            echo "Build Energy Usage: ${BUILD_ENERGY:-0} watt-secondes"
+            echo "Test Energy Usage: ${TEST_ENERGY:-0} watt-secondes"
+            echo "Total Energy Usage: ${TOTAL_ENERGY} watt-secondes"
+            echo "Estimated CO2 Emissions: ${CO2_ESTIMATE} kg CO2e"
+            echo ""
+            echo "=== Resource Usage Details ==="
+            echo "Build Duration: ${BUILD_TIME:-0}ms"
+            echo "Test Duration: ${TEST_TIME:-0}ms"
+            echo "Average CPU Usage: ${AVG_CPU}%"
+            echo "Average Memory Usage: ${AVG_MEM}MB"
+            echo ""
+            echo "Note: Ces estimations sont basées sur des moyennes et des facteurs de conversion standard."
+          } > metrics/energy/energy_report.txt
+
       - name: Export metrics to Prometheus
         if: always()
         timeout-minutes: 5
@@ -183,10 +278,17 @@ jobs:
             fi
           }
           
+          # Export des métriques de durée
           export_metric "pipeline_build_duration_ms" "${BUILD_TIME}" "build"
           export_metric "pipeline_test_duration_ms" "${TEST_TIME}" "test"
           export_metric "pipeline_docker_build_duration_ms" "${DOCKER_BUILD_TIME}" "docker-build"
           export_metric "pipeline_deploy_duration_ms" "${DEPLOY_TIME}" "deploy"
+          
+          # Export des métriques énergétiques
+          export_metric "pipeline_energy_consumption_ws" "${BUILD_ENERGY}" "build"
+          export_metric "pipeline_energy_consumption_ws" "${TEST_ENERGY}" "test"
+          export_metric "pipeline_total_energy_consumption_ws" "${TOTAL_ENERGY}" "total"
+          export_metric "pipeline_co2_emissions_kg" "${CO2_ESTIMATE}" "total"
 
       - name: Collect resource metrics
         if: always()
@@ -229,6 +331,14 @@ jobs:
             kill $NODE_EXPORTER_PID || echo "::warning::Failed to stop node exporter"
           fi
           
+          if [ -n "$MPSTAT_PID" ]; then
+            kill $MPSTAT_PID || echo "::warning::Failed to stop mpstat"
+          fi
+          
+          if [ -n "$FREE_PID" ]; then
+            kill $FREE_PID || echo "::warning::Failed to stop free"
+          fi
+          
           {
             echo "=== System Resources ===" > system_metrics.txt
             top -b -n 1 >> system_metrics.txt
@@ -250,6 +360,9 @@ jobs:
         with:
           name: pipeline-metrics
           path: |
+            metrics/energy/energy_report.txt
+            metrics/resources/
+            metrics/energy/
             system_metrics.txt
             memory_metrics.txt
             disk_metrics.txt
