@@ -4,7 +4,7 @@ on:
   push:
     branches: [ pipeline-imageDockeroptimization ]
   pull_request:
-    branches: [pipeline-imageDockeroptimization ]
+    branches: [ pipeline-imageDockeroptimization ]
 
 jobs:
   build-with-metrics:
